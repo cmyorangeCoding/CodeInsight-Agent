@@ -1,0 +1,47 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.egg-info/
+build/
+dist/
+
+# Virtual environment
+.venv/
+venv/
+
+# Environment variables (never commit real secrets)
+.env
+.env.local
+.env.*.local
+
+# IDE
+.idea/
+.vscode/
+
+# Test / lint caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Frontend
+node_modules/
+web/dist/
+web/node_modules/
+web/.vite/
+
+# Logs
+*.log
+logs/
+
+# Orchestration / eval outputs (generated, not source)
+runs/
+evals/results/
+evals/reports/
+# evals/dataset/tasks.jsonl is the materialized dataset — committed as deliverable
+
+# OS
+.DS_Store
+Thumbs.db
