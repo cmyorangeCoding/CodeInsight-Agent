@@ -8,19 +8,17 @@ CodeInsight-Agent 是一个「代码仓库理解」方向的 LLM Agent 项目。
 
 ## 界面预览
 
-> 截图统一放在 `docs/images/`，按 `01、02、03…` 顺序编号。需要新增截图时继续按序号命名并追加即可。
-
 ### 主界面与仓库接入
 
-|  |  |
-|---|---|
-| ![主界面](docs/images/01-home.png) | ![仓库配置](docs/images/02-repo-config.png) |
+![主界面](docs/images/01-home.png)
+
+![仓库配置](docs/images/02-repo-config.png)
 
 ### 执行过程与代码证据
 
-|  |  |
-|---|---|
-| ![执行进度](docs/images/03-progress.png) | ![代码证据](docs/images/04-evidence.png) |
+![执行进度](docs/images/03-progress.png)
+
+![代码证据](docs/images/04-evidence.png)
 
 ### 最终回答
 
@@ -30,7 +28,7 @@ CodeInsight-Agent 是一个「代码仓库理解」方向的 LLM Agent 项目。
 
 ## 项目介绍
 
-传统代码搜索只能给出「文本命中」，IDE 助手又通常绑定在单个编辑器里。CodeInsight-Agent 想解决的是：
+传统代码搜索只能给出「文本命中」， 大部分AI问答助手又通常绑定在单个编辑器里。CodeInsight-Agent 想解决的是：
 
 - **跨文件问题**：一个函数从入口到真正执行经过了哪些模块？只靠 grep 很难回答。
 - **自然语言提问**：不需要记住符号名，直接问「这个项目的鉴权流程是怎样的」。
@@ -418,6 +416,4 @@ CodeInsight-Agent/
 
 ---
 
-## 许可证
 
-本项目暂未声明开源许可证。如需开源发布，请补充 `LICENSE` 文件。
