@@ -8,22 +8,23 @@ CodeInsight-Agent 是一个「代码仓库理解」方向的 LLM Agent 项目。
 
 ## 界面预览
 
-> 截图占位：把图片放到 `docs/images/` 目录并使用下面这些文件名，即可自动显示。
+> 截图统一放在 `docs/images/`，按 `01、02、03…` 顺序编号。需要新增截图时继续按序号命名并追加即可。
 
-### 主界面（提问 + 策略选择 + 仓库接入）
+### 主界面与仓库接入
 
-<!-- 替换为你的截图：docs/images/ui-main.png -->
-![主界面](docs/images/ui-main.png)
+|  |  |
+|---|---|
+| ![主界面](docs/images/01-home.png) | ![仓库配置](docs/images/02-repo-config.png) |
 
-### 执行过程（进度、工具调用、检索证据）
+### 执行过程与代码证据
 
-<!-- 替换为你的截图：docs/images/ui-progress.png -->
-![执行进度与代码证据](docs/images/ui-progress.png)
+|  |  |
+|---|---|
+| ![执行进度](docs/images/03-progress.png) | ![代码证据](docs/images/04-evidence.png) |
 
-### 历史任务回看（按仓库分组）
+### 最终回答
 
-<!-- 替换为你的截图：docs/images/ui-history.png -->
-![历史任务回看](docs/images/ui-history.png)
+![最终回答](docs/images/05-answer.png)
 
 ---
 
@@ -181,6 +182,23 @@ flowchart LR
 
 ---
 
+## 数据库结构
+
+完整建表脚本见 [db/schema.sql](db/schema.sql)，共 10 张表，分四组：
+
+| 分组 | 表 | 用途 |
+|---|---|---|
+| RAG 索引 | `code_chunks` | 代码切片 + 1024 维向量 + 全文检索列 `content_tsv` |
+| 历史任务 | `runs` | 仓库路径、问题、最终回答、耗时、事件快照 `events_json` |
+| 短期记忆 | `checkpoints`、`checkpoint_blobs`、`checkpoint_writes`、`checkpoint_migrations` | LangGraph checkpointer，按 `repo-{repository_id}` 保存对话线程状态 |
+| 长期记忆 | `store`、`store_vectors`、`store_migrations`、`vector_migrations` | PostgresStore 保存用户偏好 / 项目事实，并对文本做向量检索 |
+
+- **短期记忆**保存「对话进行到哪一步」，负责同一仓库的多轮提问续接，不同仓库完全隔离。
+- **长期记忆**保存「跨会话仍然有用的信息」，由 Agent 通过记忆工具按需读写。
+- **历史任务**的 `events_json` 与实时 SSE 事件格式一致，历史回看时直接复用前端渲染逻辑，执行进度与代码证据可完整恢复。
+
+---
+
 ## 快速开始
 
 ### 环境要求
@@ -237,35 +255,22 @@ DATABASE_URL=postgresql://user:password@127.0.0.1:5432/codeinsight?sslmode=disab
 
 ### 4. 初始化数据库
 
-创建数据库后，执行以下 SQL（`code_chunks` 为 RAG 索引表，需要手动创建）：
+先创建数据库：
 
-```sql
-CREATE EXTENSION IF NOT EXISTS vector;
-
-CREATE TABLE IF NOT EXISTS code_chunks (
-    id             VARCHAR PRIMARY KEY,
-    repository_id  VARCHAR NOT NULL,
-    file_path      VARCHAR NOT NULL,
-    symbol_name    VARCHAR,
-    language       VARCHAR,
-    line_start     INTEGER NOT NULL,
-    line_end       INTEGER NOT NULL,
-    content        TEXT NOT NULL,
-    embedding_text TEXT NOT NULL,
-    embedding      vector(1024) NOT NULL,
-    content_hash   VARCHAR NOT NULL,
-    content_tsv    tsvector GENERATED ALWAYS AS (to_tsvector('simple', content)) STORED
-);
-
-CREATE INDEX IF NOT EXISTS idx_code_chunks_repository
-    ON code_chunks (repository_id);
-CREATE INDEX IF NOT EXISTS idx_code_chunks_file
-    ON code_chunks (repository_id, file_path);
-CREATE INDEX IF NOT EXISTS idx_code_chunks_tsv
-    ON code_chunks USING GIN (content_tsv);
+```bash
+createdb codeinsight
+# 或：psql -c "CREATE DATABASE codeinsight;"
 ```
 
-`runs` 历史表会在后端启动时自动创建；LangGraph 的 checkpoint / store 表会在首次任务运行时自动初始化。
+然后执行仓库内的完整结构脚本 [db/schema.sql](db/schema.sql)：
+
+```bash
+psql "postgresql://user:password@127.0.0.1:5432/codeinsight" -f db/schema.sql
+```
+
+没有 `psql` 命令时，也可以把 `db/schema.sql` 的内容直接粘贴到 Navicat / DBeaver / pgAdmin 中执行。
+
+> `code_chunks`（RAG 索引）必须初始化；`runs`（历史任务）与 LangGraph 的 checkpoint / store 表也会在运行时自动创建。脚本里保留了全部表结构，方便空库一次性建好或对照排查。
 
 ### 5. 启动后端
 
@@ -354,6 +359,10 @@ CodeInsight-Agent/
 │   ├── config.py            # 集中配置
 │   ├── indexing.py          # 索引构建共享入口
 │   └── event_mapper.py      # Tracer 事件 → SSE 事件映射
+├── db/
+│   └── schema.sql           # 完整数据库结构（10 张表，空库初始化用）
+├── docs/
+│   └── images/              # README 界面截图
 ├── web/                     # Vue 3 前端
 │   └── src/
 │       ├── App.vue
