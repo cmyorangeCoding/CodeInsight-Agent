@@ -17,12 +17,14 @@ RESULTS_DIR = EVALS_DIR / "results"
 REPORTS_DIR = EVALS_DIR / "reports"
 
 # 对比的编排配置（variant 名称 → 参数）
+# - auto：调用真实自动路由（ComplexityRouter，force=None），用于评测路由决策本身
 # - direct / react：强制单一步骤策略（react 与原 baseline 能力一致：同工具/偏好注入/摘要压缩）
 # - plan：规划+执行，不做验证、不重规划（手动模式，不进自动路由）
 # - plan_verifier：规划+执行+验证
 # - plan_replan：规划+执行+验证+有限重规划
 # 注：原 baseline 变体已于 2026-10-22 移除——实测其与 react 能力等价（见 reports/CONCLUSIONS.md）
 VARIANTS: dict[str, dict] = {
+    "auto": {"kind": "orch", "force": ""},
     "direct": {"kind": "orch", "force": "direct"},
     "react": {"kind": "orch", "force": "react"},
     "plan": {"kind": "orch", "force": "plan", "verify": False, "replans": 0},

@@ -96,6 +96,7 @@ class SearchCodeTool(BaseTool):
         "按精确关键词/标识符做文本匹配搜索（类似 grep），返回匹配处的代码证据。"
         "这是【兜底工具】：只有在 search_code_rag 返回为空或证据不足时，"
         "才用它做精确文本补充。请勿作为首选。"
+        "参数 keyword 必填：要搜索的关键词或标识符（如类名、函数名）。"
     )
     model_config = ConfigDict(extra="allow", arbitrary_types_allowed=True)
 
@@ -109,14 +110,24 @@ class SearchCodeTool(BaseTool):
         self.token_budget = token_budget
         self.builder = ContextBuilder(max_chars=12000, token_budget=token_budget)
 
-    def _run(self, keyword: str, max_results: int = 20, context_lines: int = 3) -> str:
+    def _run(
+        self,
+        keyword: str | None = None,
+        query: str | None = None,
+        max_results: int = 20,
+        context_lines: int = 3,
+    ) -> str:
+        # keyword 为主参数；query 为兼容别名——模型习惯用 query，直接 TypeError 会中断调用链
+        kw = keyword or query
+        if not kw:
+            return "缺少检索关键词：请提供 keyword 参数（要搜索的类名/函数名/标识符）。"
         results = self._provider.search_code(
-            keyword=keyword,
+            keyword=kw,
             max_results=max_results,
             context_lines=context_lines,
         )
         if not results:
-            return f"没有找到关键词：{keyword}"
+            return f"没有找到关键词：{kw}"
         return self.builder.build(results)
 
 

@@ -67,6 +67,15 @@ class ComplexityRouter:
 
     # ------------------------------------------------------------------ 规则
     @staticmethod
+    def _with_rule_audit(decision: RouteDecision) -> RouteDecision:
+        """给规则判断结果回填审计字段（rule_* 与自身一致）。"""
+        decision.rule_strategy = decision.strategy
+        decision.rule_confidence = decision.confidence
+        decision.rule_reason = decision.reason
+        decision.rule_signals = list(decision.matched_signals)
+        return decision
+
+    @staticmethod
     def rule_route(question: str) -> RouteDecision:
         """纯规则的确定性判断。"""
         text = (question or "").strip()
@@ -81,56 +90,56 @@ class ComplexityRouter:
             matched = strong
             # 同时命中定位词时，若问题很短且只问位置，仍可回落 ReAct
             if direct and len(text) <= 40 and not weak:
-                return RouteDecision(
+                return ComplexityRouter._with_rule_audit(RouteDecision(
                     strategy=Strategy.REACT,
                     reason=f"同时命中复杂与定位信号，长度较短，先按 ReAct 处理；命中={matched[:3]}",
                     source="rule",
                     confidence=0.6,
                     matched_signals=matched[:5],
-                )
-            return RouteDecision(
+                ))
+            return ComplexityRouter._with_rule_audit(RouteDecision(
                 strategy=Strategy.REACT,
                 reason=f"命中强复杂信号，需要多维度/跨模块分析；命中={matched[:3]}（plan 仅手动启用，自动路由按 ReAct）",
                 source="rule",
                 confidence=1.0,
                 matched_signals=matched[:5],
-            )
+            ))
 
         if weak:
-            return RouteDecision(
+            return ComplexityRouter._with_rule_audit(RouteDecision(
                 strategy=Strategy.REACT,
                 reason=f"命中中等复杂信号，先多轮检索再判断；命中={weak[:3]}",
                 source="rule",
                 confidence=0.5,
                 matched_signals=weak[:5],
-            )
+            ))
 
         if direct and len(text) <= 80:
-            return RouteDecision(
+            return ComplexityRouter._with_rule_audit(RouteDecision(
                 strategy=Strategy.DIRECT,
                 reason=f"定位型简单问题，一次检索即可回答；命中={direct[:3]}",
                 source="rule",
                 confidence=0.8,
                 matched_signals=direct[:5],
-            )
+            ))
 
         # 提到具体文件路径 → 倾向 Direct
         if ".py" in lowered and len(text) <= 120:
-            return RouteDecision(
+            return ComplexityRouter._with_rule_audit(RouteDecision(
                 strategy=Strategy.DIRECT,
                 reason="问题中给出具体文件路径，按 Direct 处理",
                 source="rule",
                 confidence=0.7,
                 matched_signals=["file_path"],
-            )
+            ))
 
-        return RouteDecision(
+        return ComplexityRouter._with_rule_audit(RouteDecision(
             strategy=Strategy.REACT,
             reason="未命中明确信号，按默认 ReAct 处理",
             source="rule",
             confidence=0.5,
             matched_signals=[],
-        )
+        ))
 
     # ------------------------------------------------------------------ 主流程
     def route(self, question: str, force: Strategy | None = None) -> RouteDecision:
@@ -142,6 +151,7 @@ class ComplexityRouter:
                 source="forced",
                 confidence=1.0,
                 matched_signals=["forced"],
+                adoption="forced",
             )
             self._log(strategy=str(decision.strategy), source="forced", reason=decision.reason)
             return decision
@@ -149,28 +159,40 @@ class ComplexityRouter:
         rule_decision = self.rule_route(question)
         # 规则已经很确定 / 不允许用模型 → 直接用规则
         if not self.use_llm or self.llm is None or rule_decision.confidence >= 0.8:
+            rule_decision.adoption = "rule_only"
             self._log(
                 strategy=str(rule_decision.strategy),
                 source="rule",
                 reason=rule_decision.reason,
                 confidence=rule_decision.confidence,
+                adoption="rule_only",
             )
             return rule_decision
 
         try:
             verdict = self._llm_route(question)
         except Exception as exc:  # noqa: BLE001 - 模型不可用时回落规则
+            rule_decision.adoption = "rule_fallback"
+            rule_decision.reason = (
+                f"{rule_decision.reason}（模型判断失败，回落规则：{type(exc).__name__}）"
+            )
             self._log(
                 strategy=str(rule_decision.strategy),
                 source="rule",
-                reason=f"{rule_decision.reason}（模型判断失败，回落规则：{type(exc).__name__}）",
+                reason=rule_decision.reason,
                 confidence=rule_decision.confidence,
+                adoption="rule_fallback",
             )
             return rule_decision
 
         llm_strategy = Strategy(verdict.strategy)
         # 只升不降：模型不得把规则判定的复杂任务降级
-        final = llm_strategy if _ORDER[llm_strategy] >= _ORDER[rule_decision.strategy] else rule_decision.strategy
+        if _ORDER[llm_strategy] >= _ORDER[rule_decision.strategy]:
+            final = llm_strategy
+            adoption = "llm_upgrade" if _ORDER[llm_strategy] > _ORDER[rule_decision.strategy] else "llm_agree"
+        else:
+            final = rule_decision.strategy
+            adoption = "llm_downgrade_blocked"
         # 自动路由只在 Direct / ReAct 之间选择：
         # Plan-and-Execute 实测开销大（见 evals/reports/CONCLUSIONS.md），仅允许手动强制启用
         if final == Strategy.PLAN_EXECUTE:
@@ -180,14 +202,27 @@ class ComplexityRouter:
             reason=f"规则={rule_decision.strategy}({rule_decision.reason})；模型={llm_strategy}({verdict.reason})"
                    + ("；plan 已降级为 react（plan 仅手动启用）" if llm_strategy == Strategy.PLAN_EXECUTE else ""),
             source="llm",
-            confidence=verdict.confidence,
+            # 最终置信度语义：采纳 LLM 时取 LLM，被拦截回落规则时取规则
+            confidence=verdict.confidence if adoption != "llm_downgrade_blocked" else rule_decision.confidence,
             matched_signals=rule_decision.matched_signals,
+            rule_strategy=rule_decision.strategy,
+            rule_confidence=rule_decision.confidence,
+            rule_reason=rule_decision.reason,
+            rule_signals=list(rule_decision.matched_signals),
+            llm_strategy=llm_strategy,
+            llm_confidence=verdict.confidence,
+            llm_reason=verdict.reason,
+            adoption=adoption,
         )
         self._log(
             strategy=str(decision.strategy),
             source="llm",
             reason=decision.reason,
             confidence=decision.confidence,
+            adoption=adoption,
+            rule_strategy=str(rule_decision.strategy),
+            llm_strategy=str(llm_strategy),
+            llm_confidence=verdict.confidence,
         )
         return decision
 

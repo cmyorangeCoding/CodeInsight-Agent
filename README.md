@@ -65,15 +65,20 @@ CodeInsight-Agent 是一个「代码仓库理解」方向的 LLM Agent 项目。
 
 ### 4. 多策略编排 + 复杂度路由
 
-编排层提供三种执行策略，由「规则 + 轻量模型」路由器选择：
+编排层提供四种执行策略，`auto` 为默认自动路由：
 
 | 策略 | 适用场景 |
 |---|---|
+| `auto` | 默认；由「规则 + 轻量模型」在 `direct` / `react` 之间选择 |
 | `direct` | 定位型问题（某个类/函数在哪个文件） |
 | `react` | 需要多轮工具调用的中等复杂问题 |
-| `plan_execute` | 用户显式要求的深度分析、跨模块调用链 |
+| `plan_execute` | 用户显式选择的深度分析；不参与自动路由 |
 
-`plan_execute` 默认**不自动启用**，需要用户手动选择。这个取舍来自真实评测数据，详见 [ORCHESTRATION_DECISION.md](ORCHESTRATION_DECISION.md)。
+路由流程：规则先给出建议（命中强复杂信号时置信度 1.0），低置信度再调用摘要模型复核；复核**只升不降**，避免复杂任务被模型误降为 `direct`。`plan_execute` 会被归一为 `react`，只能手动启用。
+
+每次路由都会分别记录**规则建议 / LLM 建议 / 最终采纳策略 / 采纳原因**（`rule_strategy`、`llm_strategy`、`adoption` 等字段），便于事后归因，不会把不同来源的置信度混在一起。
+
+`plan_execute` 默认**不自动启用**的取舍来自真实评测数据，详见 [ORCHESTRATION_DECISION.md](ORCHESTRATION_DECISION.md)；27 题 × Auto/Direct/ReAct 的路由专项评测见 [ROUTING_EVAL.md](evals/reports/ROUTING_EVAL.md)。
 
 ### 5. 全链路可观测 + SSE 实时推送
 
@@ -94,6 +99,8 @@ CodeInsight-Agent 是一个「代码仓库理解」方向的 LLM Agent 项目。
 ### 8. 自带评测体系
 
 `evals/` 提供任务数据集、评分器、对比运行器与报告产出，可复现不同编排策略在真实仓库问题上的质量、耗时与 token 消耗。
+
+评测 Runner 支持 `auto` 配置，直接调用真实路由器，因此除了回答质量，还能评测**路由决策本身**：规则建议、LLM 建议、最终采纳策略、误路由（过度/欠路由）、规则与最终策略的差异，以及同题下 Auto 与强制策略的配对比较。
 
 ---
 
@@ -368,6 +375,8 @@ CodeInsight-Agent/
 │       └── main.ts
 ├── tests/                   # 单元 / 集成测试
 ├── evals/                   # 评测数据集、评分器、运行器、报告
+│   ├── dataset/             # 27 题数据集（含意图 / 预期策略标注）
+│   └── reports/             # 人工结论（结论文档入库，自动报告不入库）
 ├── scripts/                 # 手动验证脚本（GitHub / MCP / E2E）
 ├── requirements.txt
 ├── .env.example
@@ -388,26 +397,38 @@ CodeInsight-Agent/
 ### 校验评测数据集
 
 ```bash
-.venv\Scripts\python.exe evals\run_eval.py --validate-only
+.venv\Scripts\python.exe -m evals.run_eval --validate-only
 ```
 
 ### 运行策略对比评测
 
 ```bash
 # 只跑指定任务，对比 react 与 plan
-.venv\Scripts\python.exe evals\run_eval.py --ids simple-01 --variants react,plan
+.venv\Scripts\python.exe -m evals.run_eval --ids simple-01 --variants react,plan
+
+# 自动路由 vs 强制策略（Auto / Direct / ReAct 全量对比）
+.venv\Scripts\python.exe -m evals.run_eval --variants auto,direct,react --concurrency 3
 
 # 按类别筛选
-.venv\Scripts\python.exe evals\run_eval.py --category architecture --limit 3
+.venv\Scripts\python.exe -m evals.run_eval --category architecture --limit 3
 ```
 
-评测结果输出到 `evals/results/`（原始 JSONL）与 `evals/reports/`（Markdown/JSON 报告），这两个目录默认不提交到 Git。
+自动生成的评测结果输出到 `evals/results/`（原始 JSONL）与 `evals/reports/`（Markdown/JSON 报告），默认不提交到 Git；人工撰写的结论（`ROUTING_EVAL.md`、`CONCLUSIONS.md`）随源码提交。
+
+每道评测题除答案与证据外，还标注了 `intent`（意图类别）、`expected_strategy` / `expected_strategy_reason`（预期策略及判断依据，仅作分析参考）。报告除质量与开销外，会单列：
+
+- 每题的规则策略、LLM 建议、最终策略、采纳原因；
+- 误路由明细（过度路由 / 欠路由）；
+- Auto 与最佳强制策略的同题配对质量差与 Token/耗时对比。
+
+当前结论见 [ROUTING_EVAL.md](evals/reports/ROUTING_EVAL.md)（27 题、81 次真实运行）。
 
 ---
 
 ## 设计说明与已知限制
 
 - **编排策略取舍**：`plan_execute` 在不稳定场景下开销显著高于 `react`，因此默认交给用户手动选择，而不是由路由器自动升级。完整数据与结论见 [ORCHESTRATION_DECISION.md](ORCHESTRATION_DECISION.md)。
+- **自动路由偏置**：当前规则在低置信度时默认 `react`，且 LLM 复核只升不降，因此简单任务可能被路由到 `react`。该偏置已在 27 题评测中量化（6 道过度路由、0 道欠路由，其中仅 1 道有明确成本损失），暂未调整规则，详见 [ROUTING_EVAL.md](evals/reports/ROUTING_EVAL.md)。
 - **模型依赖**：当前默认对接阿里云 DashScope 的 OpenAI 兼容接口，更换模型需同时确认对话与 Embedding 能力。
 - **GitHub MCP**：按需读取模式需要本机具备 Node.js 与 `npx`；无 Token 时受公开仓库速率限制。
 - **首次索引耗时**：大仓库首次全量索引需要调用 Embedding 接口，耗时与文件数量、网络状况相关；后续任务只做增量检查。

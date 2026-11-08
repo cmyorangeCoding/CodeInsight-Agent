@@ -749,5 +749,10 @@ class Orchestrator:
             plan_steps_completed=sum(1 for s in plan.steps if s.status == StepStatus.COMPLETED) if plan else 0,
             route_source=route.source,
             route_reason=route.reason,
+            route_confidence=route.confidence,
+            route_signals=list(route.matched_signals),
+            route_rule_strategy=str(route.rule_strategy) if route.rule_strategy else None,
+            route_llm_strategy=str(route.llm_strategy) if route.llm_strategy else None,
+            route_adoption=route.adoption,
             limits=self.limits.as_dict(),
         )

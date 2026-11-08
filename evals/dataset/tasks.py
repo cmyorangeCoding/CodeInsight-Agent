@@ -1,4 +1,4 @@
-"""第一版评估任务集：25 个基于当前真实仓库的代码分析问题。
+"""评估任务集：27 个基于当前真实仓库的代码分析问题。
 
 覆盖类别（每类 5 个）：
     simple_lookup          简单定位查询
@@ -6,6 +6,7 @@
     architecture           架构分析
     code_review            代码审查
     history_decision       历史决策与项目知识
+    multi_part_audit      为 Plan 设计的多子任务题
 
 证据来源说明：
 - 前 4 类的 required_evidence 指向真实文件 + 符号 + **稳定代码锚点**（anchor），
@@ -886,3 +887,123 @@ TASKS: list[dict] = [
                            "note": "枚举完整性是关键：漏掉任一配置点即扣分"},
     },
 ]
+
+# ======================================================= 路由评测元数据
+# 说明：expected_strategy 仅作为「评测分析参考」，不是绝对正确答案；
+# 最终是否合理要以同一题目在 Auto / Direct / ReAct 下的真实表现判定。
+# 口径：direct = 预计 1~2 次工具调用、单文件或紧邻两个文件即可作答；
+#       react  = 需要跨 3 个以上文件、或多轮「观察→再检索」才能拼出结论。
+ROUTING_METADATA: dict[str, dict] = {
+    "simple-01": {
+        "intent": "定位查询", "expected_strategy": "direct",
+        "expected_strategy_reason": "单个函数定义与返回类型，一次检索 + 一次精读即可",
+    },
+    "simple-02": {
+        "intent": "定位查询", "expected_strategy": "direct",
+        "expected_strategy_reason": "工具名与依赖类固定，且答案中给出符号名，2 次读取内可完成",
+    },
+    "simple-03": {
+        "intent": "定位查询", "expected_strategy": "direct",
+        "expected_strategy_reason": "chunk_file 单文件内语言分支，一次精读即可",
+    },
+    "simple-04": {
+        "intent": "定位查询", "expected_strategy": "direct",
+        "expected_strategy_reason": "单文件内两处符号（check_context / estimate_tokens）",
+    },
+    "simple-05": {
+        "intent": "跨文件因果解释", "expected_strategy": "direct",
+        "expected_strategy_reason": "只涉及 models.py 与 postgres_resources.py 两个文件的两个锚点",
+    },
+    "chain-01": {
+        "intent": "端到端调用链", "expected_strategy": "react",
+        "expected_strategy_reason": "跨 api / orchestration / models / agents 多层，需多轮定位与串联",
+    },
+    "chain-02": {
+        "intent": "检索链路追溯", "expected_strategy": "react",
+        "expected_strategy_reason": "工具 → retriever → 两路召回 → RRF，至少 3 个函数与数据库查询细节",
+    },
+    "chain-03": {
+        "intent": "异常拦截链路", "expected_strategy": "react",
+        "expected_strategy_reason": "需同时覆盖中间件、异常定义、编排层捕获三处",
+    },
+    "chain-04": {
+        "intent": "写入流程追踪", "expected_strategy": "react",
+        "expected_strategy_reason": "工具 → 校验 → 冲突判定 → 写库，跨 3 个文件 4 段流程",
+    },
+    "chain-05": {
+        "intent": "索引流程追踪", "expected_strategy": "react",
+        "expected_strategy_reason": "入口、主流程、切块、入库分布在 4 个文件，需依次追溯",
+    },
+    "arch-01": {
+        "intent": "装配结构理解", "expected_strategy": "react",
+        "expected_strategy_reason": "工具构建 + create_agent + 三中间件，集中在单文件但需多段上下文",
+    },
+    "arch-02": {
+        "intent": "中间件生命周期", "expected_strategy": "react",
+        "expected_strategy_reason": "三种中间件 × 两种钩子时机，跨 memory_context 与 repository_agent",
+    },
+    "arch-03": {
+        "intent": "模块职责边界", "expected_strategy": "react",
+        "expected_strategy_reason": "需逐一读取 rag 四个模块的职责声明并对比边界",
+    },
+    "arch-04": {
+        "intent": "命名空间与白名单", "expected_strategy": "react",
+        "expected_strategy_reason": "命名空间 + 两类白名单跨 long_term_memory 与 memory_policy",
+    },
+    "arch-05": {
+        "intent": "整体分层理解", "expected_strategy": "react",
+        "expected_strategy_reason": "需遍历多个目录并解释 repository 抽象层定位，证据面较广",
+    },
+    "review-01": {
+        "intent": "单点缺陷审查", "expected_strategy": "direct",
+        "expected_strategy_reason": "仅需定位 index_repository 内的 zip 配对与缺断言",
+    },
+    "review-02": {
+        "intent": "单点缺陷审查", "expected_strategy": "direct",
+        "expected_strategy_reason": "仅需检查 upsert_file_chunks 的提交与回滚分支",
+    },
+    "review-03": {
+        "intent": "跨文件一致性审查", "expected_strategy": "react",
+        "expected_strategy_reason": "必须同时读取 ingestion 的大小上限与 search_code 的遍历实现并对比",
+    },
+    "review-04": {
+        "intent": "单点缺陷审查", "expected_strategy": "react",
+        "expected_strategy_reason": "首版标注 direct；2026-11-08 实测 Direct 触发 GraphRecursionError，"
+                                    "ReAct 可完成，按实际表现改标 react",
+    },
+    "review-05": {
+        "intent": "边界条件审查", "expected_strategy": "react",
+        "expected_strategy_reason": "首版标注 direct；实测 Direct 事实覆盖仅 0.6，ReAct 为 1.0，按实际表现改标 react",
+    },
+    "hist-01": {
+        "intent": "设计决策溯源", "expected_strategy": "react",
+        "expected_strategy_reason": "需同时核实 pgvector 字段、PostgresStore 复用与连接串三处依据",
+    },
+    "hist-02": {
+        "intent": "设计决策溯源", "expected_strategy": "react",
+        "expected_strategy_reason": "首版标注 direct；实测 Direct 事实覆盖仅 0.5、ReAct 为 1.0，按实际表现改标 react",
+    },
+    "hist-03": {
+        "intent": "设计决策溯源", "expected_strategy": "direct",
+        "expected_strategy_reason": "单文件内参数设置与注释两处证据",
+    },
+    "hist-04": {
+        "intent": "设计决策溯源", "expected_strategy": "direct",
+        "expected_strategy_reason": "单文件内常量与注释两处证据",
+    },
+    "hist-05": {
+        "intent": "设计决策溯源", "expected_strategy": "react",
+        "expected_strategy_reason": "首版标注 direct；实测 Direct 因递归上限失败，ReAct 可完成，按实际表现改标 react",
+    },
+    "audit-01": {
+        "intent": "多问题综合分析", "expected_strategy": "react",
+        "expected_strategy_reason": "三模式差异 + 两处记录实现，多个独立子问题需分别取证",
+    },
+    "audit-02": {
+        "intent": "多点枚举完整性", "expected_strategy": "react",
+        "expected_strategy_reason": "要求枚举全部配置点，需跨 api 与 evals 两个目录检索确认无遗漏",
+    },
+}
+
+for _task in TASKS:
+    _task.update(ROUTING_METADATA.get(_task["id"], {}))

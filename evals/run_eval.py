@@ -23,6 +23,7 @@ import json
 import sys
 import time
 import uuid
+from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from pathlib import Path
@@ -37,6 +38,7 @@ from app.observability.token_budget import TokenBudget
 from app.observability.tracer import Tracer
 from app.indexing import build_local_provider, ensure_index
 from app.agents.repository_agent import build_repository_tools, create_repository_agent_factory
+from app.orchestration.complexity import ComplexityRouter
 from app.orchestration.executor import Orchestrator
 from app.orchestration.limits import OrchestrationLimits
 from app.orchestration.models import RunRecord, Strategy
@@ -150,12 +152,27 @@ class EvalRunner:
             result = orchestrator.run(
                 task["question"], question_id=task["id"], force_strategy=forced, thread_id=thread_id
             )
+            # LLM 调用次数只统计 Agent 侧模型调用（路由/裁判的调用单独按 route_source 标记）
+            events = tracer.summary().get("events", [])
+            llm_call_count = sum(1 for e in events if e.get("type") == "model_start")
             return {
                 "answer": result.answer,
                 "record": result.record,
                 "evidence_refs": orchestrator._collect_evidence(),
                 "plan": result.plan,
                 "verification": result.verification,
+                "route": {
+                    "strategy": str(result.route.strategy),
+                    "source": result.route.source,
+                    "confidence": result.route.confidence,
+                    "reason": result.route.reason,
+                    "matched_signals": list(result.route.matched_signals),
+                    "rule_strategy": str(result.route.rule_strategy) if result.route.rule_strategy else None,
+                    "llm_strategy": str(result.route.llm_strategy) if result.route.llm_strategy else None,
+                    "llm_confidence": result.route.llm_confidence,
+                    "adoption": result.route.adoption,
+                },
+                "llm_call_count": llm_call_count,
                 "error": result.record.error,
             }
         finally:
@@ -171,12 +188,21 @@ class EvalRunner:
     # -- 单次运行 -----------------------------------------------------------
     def run_once(self, task: dict, variant: str, variant_cfg: dict, repeat: int) -> dict:
         thread_id = f"eval-{task['id']}-{variant}-{repeat}-{uuid.uuid4().hex[:6]}"
+        # 规则基线：复用真实规则判断（不重写路由逻辑），用于对比「规则 vs 最终路由器」的差异
+        rule_decision = ComplexityRouter.rule_route(task["question"])
+        rule_snapshot = {
+            "strategy": str(rule_decision.strategy),
+            "confidence": rule_decision.confidence,
+            "signals": list(rule_decision.matched_signals),
+            "reason": rule_decision.reason,
+        }
         try:
             outcome = self._run_orch(task, variant_cfg, thread_id)
         except Exception as exc:  # noqa: BLE001 - 装配阶段异常也要留记录
             outcome = {
                 "answer": "", "record": None, "evidence_refs": [], "plan": None,
-                "verification": None, "error": f"{type(exc).__name__}: {exc}",
+                "verification": None, "route": None, "llm_call_count": None,
+                "error": f"{type(exc).__name__}: {exc}",
             }
 
         record: RunRecord | None = outcome["record"]
@@ -233,9 +259,15 @@ class EvalRunner:
         return {
             "task_id": task["id"],
             "category": task["category"],
+            "intent": task.get("intent"),
+            "expected_strategy": task.get("expected_strategy"),
+            "expected_strategy_reason": task.get("expected_strategy_reason"),
             "variant": variant,
             "repeat": repeat,
             "strategy": record.strategy if record else variant,
+            "route": outcome.get("route"),
+            "rule_route": rule_snapshot,
+            "llm_call_count": outcome.get("llm_call_count"),
             "answer": outcome["answer"],
             "error": outcome["error"],
             "record": record.model_dump() if record else None,
@@ -243,6 +275,190 @@ class EvalRunner:
             "verification": verification,
             "score": score.model_dump(),
         }
+
+
+# --------------------------------------------------------------------------- 路由分析
+def _quality(row: dict) -> float:
+    value = (row.get("score") or {}).get("quality_score")
+    return float(value) if value is not None else 0.0
+
+
+def analyze_routing(rows: list[dict]) -> dict:
+    """基于 Auto 运行结果分析路由决策（来源、规则/最终策略、误路由）。"""
+    auto_rows = [r for r in rows if r.get("variant") == "auto"]
+    if not auto_rows:
+        return {"auto_runs": 0, "note": "本次未运行 auto 配置"}
+
+    decisions: list[dict] = []
+    for r in auto_rows:
+        route = r.get("route") or {}
+        rule = r.get("rule_route") or {}
+        record = r.get("record") or {}
+        final = route.get("strategy") or r.get("strategy") or "unknown"
+        expected = r.get("expected_strategy")
+        decisions.append({
+            "task_id": r.get("task_id"),
+            "category": r.get("category"),
+            "intent": r.get("intent"),
+            "rule_strategy": rule.get("strategy"),
+            "rule_confidence": rule.get("confidence"),
+            "rule_signals": rule.get("signals") or [],
+            "final_strategy": final,
+            "route_source": route.get("source"),
+            "route_confidence": route.get("confidence"),
+            "route_reason": route.get("reason"),
+            "llm_strategy": route.get("llm_strategy"),
+            "llm_confidence": route.get("llm_confidence"),
+            "adoption": route.get("adoption"),
+            "expected_strategy": expected,
+            "match_expected": None if expected is None else final == expected,
+            "status": record.get("status"),
+            "quality_score": _quality(r),
+            "evidence_coverage": (r.get("score") or {}).get("evidence_coverage"),
+            "tokens": record.get("total_tokens"),
+            "duration_ms": record.get("duration_ms"),
+            "tool_calls": record.get("tool_call_count"),
+            "llm_calls": r.get("llm_call_count"),
+            "error": r.get("error"),
+        })
+
+    by_strategy = Counter(d["final_strategy"] for d in decisions)
+    by_source = Counter(d["route_source"] or "unknown" for d in decisions)
+    by_adoption = Counter(d["adoption"] or "unknown" for d in decisions)
+    transitions = Counter(f"{d['rule_strategy']}->{d['final_strategy']}" for d in decisions)
+
+    by_category: dict[str, dict] = {}
+    for d in decisions:
+        bucket = by_category.setdefault(
+            d["category"], {"runs": 0, "strategies": Counter(), "matched": 0, "mismatched": 0, "quality": []}
+        )
+        bucket["runs"] += 1
+        bucket["strategies"][d["final_strategy"]] += 1
+        bucket["quality"].append(d["quality_score"])
+        if d["match_expected"] is True:
+            bucket["matched"] += 1
+        elif d["match_expected"] is False:
+            bucket["mismatched"] += 1
+    for bucket in by_category.values():
+        bucket["strategies"] = dict(bucket["strategies"])
+        bucket["avg_quality"] = round(sum(bucket["quality"]) / len(bucket["quality"]), 4) if bucket["quality"] else None
+        bucket.pop("quality", None)
+
+    matched = [d for d in decisions if d["match_expected"] is True]
+    mismatched = [d for d in decisions if d["match_expected"] is False]
+    over_routed = [d for d in mismatched if d["expected_strategy"] == "direct" and d["final_strategy"] == "react"]
+    under_routed = [d for d in mismatched if d["expected_strategy"] == "react" and d["final_strategy"] == "direct"]
+    upgraded = [d for d in decisions if d["rule_strategy"] == "direct" and d["final_strategy"] == "react"]
+    downgraded = [d for d in decisions if d["rule_strategy"] == "react" and d["final_strategy"] == "direct"]
+    low_conf = [d for d in decisions if (d["rule_confidence"] or 0) < 0.8]
+    low_conf_changed = [d for d in low_conf if d["rule_strategy"] != d["final_strategy"]]
+
+    return {
+        "auto_runs": len(decisions),
+        "by_strategy": dict(by_strategy),
+        "by_source": dict(by_source),
+        "by_adoption": dict(by_adoption),
+        "rule_to_final": dict(transitions),
+        "matched_expected": len(matched),
+        "mismatched_expected": len(mismatched),
+        "over_routed": over_routed,
+        "under_routed": under_routed,
+        "upgraded_by_llm": len(upgraded),
+        "downgraded_by_llm": len(downgraded),
+        "low_confidence_rule_count": len(low_conf),
+        "low_confidence_changed_count": len(low_conf_changed),
+        "by_category": by_category,
+        "decisions": decisions,
+    }
+
+
+def compare_strategy_outcomes(rows: list[dict]) -> dict:
+    """同一题目下 Auto 与强制 Direct / ReAct 的配对比较。"""
+    by_task: dict[str, dict[str, dict]] = {}
+    for r in rows:
+        by_task.setdefault(r["task_id"], {}).setdefault(r["variant"], r)
+
+    cases: list[dict] = []
+    for task_id, variants in by_task.items():
+        auto = variants.get("auto")
+        forced = {k: variants[k] for k in ("direct", "react") if k in variants}
+        if auto is None or not forced:
+            continue
+        forced_quality = {k: _quality(v) for k, v in forced.items()}
+        best_variant = max(forced_quality, key=lambda k: forced_quality[k])
+        auto_record = auto.get("record") or {}
+        best_record = forced[best_variant].get("record") or {}
+        cases.append({
+            "task_id": task_id,
+            "category": auto.get("category"),
+            "intent": auto.get("intent"),
+            "auto_strategy": (auto.get("route") or {}).get("strategy") or auto.get("strategy"),
+            "direct_quality": forced_quality.get("direct"),
+            "react_quality": forced_quality.get("react"),
+            "best_forced": best_variant,
+            "best_forced_quality": forced_quality[best_variant],
+            "auto_quality": _quality(auto),
+            "gap": round(forced_quality[best_variant] - _quality(auto), 4),
+            "auto_tokens": auto_record.get("total_tokens"),
+            "best_tokens": best_record.get("total_tokens"),
+            "auto_duration_ms": auto_record.get("duration_ms"),
+            "best_duration_ms": best_record.get("duration_ms"),
+            "auto_tool_calls": auto_record.get("tool_call_count"),
+            "best_tool_calls": best_record.get("tool_call_count"),
+            "auto_llm_calls": auto.get("llm_call_count"),
+            "best_llm_calls": forced[best_variant].get("llm_call_count"),
+        })
+
+    if not cases:
+        return {"tasks_compared": 0}
+
+    close = [c for c in cases if c["gap"] <= 0.05]
+    worse = [c for c in cases if c["gap"] > 0.05]
+    token_pairs = [(c["auto_tokens"], c["best_tokens"]) for c in close if c["auto_tokens"] and c["best_tokens"]]
+    duty_pairs = [(c["auto_duration_ms"], c["best_duration_ms"]) for c in close
+                  if c["auto_duration_ms"] and c["best_duration_ms"]]
+    return {
+        "tasks_compared": len(cases),
+        "auto_not_worse": len(close),
+        "auto_worse": len(worse),
+        "avg_gap": round(sum(c["gap"] for c in cases) / len(cases), 4),
+        "avg_auto_quality": round(sum(c["auto_quality"] for c in cases) / len(cases), 4),
+        "avg_best_forced_quality": round(sum(c["best_forced_quality"] for c in cases) / len(cases), 4),
+        "efficiency_when_comparable": {
+            "paired_runs": len(token_pairs),
+            "avg_auto_tokens": round(sum(a for a, _ in token_pairs) / len(token_pairs), 2) if token_pairs else None,
+            "avg_best_tokens": round(sum(b for _, b in token_pairs) / len(token_pairs), 2) if token_pairs else None,
+            "avg_auto_duration_ms": round(sum(a for a, _ in duty_pairs) / len(duty_pairs), 2) if duty_pairs else None,
+            "avg_best_duration_ms": round(sum(b for _, b in duty_pairs) / len(duty_pairs), 2) if duty_pairs else None,
+        },
+        "cases": sorted(cases, key=lambda c: -c["gap"]),
+    }
+
+
+def call_stats(rows: list[dict]) -> dict[str, dict]:
+    """按配置统计 LLM 调用 / 工具调用 / Token / 耗时（复用已有 record 字段）。"""
+    grouped: dict[str, list[dict]] = {}
+    for r in rows:
+        grouped.setdefault(r.get("variant") or "unknown", []).append(r)
+
+    def avg(values: list[float]) -> float | None:
+        return round(sum(values) / len(values), 2) if values else None
+
+    out: dict[str, dict] = {}
+    for variant, group in grouped.items():
+        records = [r.get("record") or {} for r in group]
+        llm_calls = [r["llm_call_count"] for r in group if r.get("llm_call_count") is not None]
+        tool_calls = [rec["tool_call_count"] for rec in records if rec.get("tool_call_count") is not None]
+        tokens = [rec["total_tokens"] for rec in records if rec.get("total_tokens") is not None]
+        durations = [rec["duration_ms"] for rec in records if rec.get("duration_ms") is not None]
+        out[variant] = {
+            "runs": len(group),
+            "avg_llm_calls": avg(llm_calls),
+            "avg_tool_calls": avg(tool_calls),
+            "avg_tokens": avg(tokens),
+            "avg_duration_ms": avg(durations),
+        }
+    return out
 
 
 # --------------------------------------------------------------------------- 报告
@@ -285,6 +501,9 @@ def build_report(
         "run_count": len(rows),
         "quality": quality,
         "reliability": reliability,
+        "routing": analyze_routing(rows),
+        "strategy_comparison": compare_strategy_outcomes(rows),
+        "call_stats": call_stats(rows),
         "anomaly_count": len(anomalies),
         "anomalies": anomalies,
         "notes": notes,
@@ -339,6 +558,104 @@ def render_markdown(report: dict) -> str:
                 f"| {variant} | {cplx} | {c['runs']} | {_fmt(c['completion_rate'])} | "
                 f"{_fmt(c['fact_coverage'])} | {_fmt(c['evidence_coverage'])} |"
             )
+
+    routing = report.get("routing") or {}
+    lines.append("\n## 路由决策分析（Auto）\n")
+    if not routing.get("auto_runs"):
+        lines.append(f"- 本次未运行 auto 配置：{routing.get('note', '')}")
+    else:
+        total_expected = routing["matched_expected"] + routing["mismatched_expected"]
+        lines.append(f"- Auto 运行 {routing['auto_runs']} 次；最终策略分布：{routing['by_strategy']}")
+        lines.append(f"- 路由来源分布：{routing['by_source']}；采纳结果分布：{routing.get('by_adoption', {})}；规则→最终：{routing['rule_to_final']}")
+        lines.append(
+            f"- 与预期策略一致 {routing['matched_expected']} / {total_expected}；"
+            f"过度路由（预期 direct → 实际 react）{len(routing['over_routed'])}；"
+            f"欠路由（预期 react → 实际 direct）{len(routing['under_routed'])}"
+        )
+        lines.append(
+            f"- 规则置信度 < 0.8 的题 {routing['low_confidence_rule_count']} 道，其中最终策略与规则不同 "
+            f"{routing['low_confidence_changed_count']} 道；LLM 升级 {routing['upgraded_by_llm']} 次、"
+            f"降级 {routing['downgraded_by_llm']} 次（当前实现为「只升不降」）"
+        )
+        lines.append(
+            "\n| 任务 | 类别 | 意图 | 规则策略 | 规则置信度 | LLM建议 | 最终策略 | 采纳 | 最终置信度 | 匹配预期 | 质量分 | Token | 工具 | LLM调用 |"
+        )
+        lines.append("|---|---|---|---|---|---|---|---|---|---|---|---|---|---|")
+        for d in routing["decisions"]:
+            lines.append(
+                f"| {d['task_id']} | {d['category']} | {d['intent'] or ''} | {d['rule_strategy']} | "
+                f"{_fmt(d['rule_confidence'])} | {d.get('llm_strategy') or '-'} | {d['final_strategy']} | "
+                f"{d.get('adoption') or '-'} | "
+                f"{_fmt(d['route_confidence'])} | "
+                f"{'是' if d['match_expected'] else ('否' if d['match_expected'] is False else 'n/a')} | "
+                f"{_fmt(d['quality_score'])} | {_fmt(d['tokens'])} | {_fmt(d['tool_calls'])} | "
+                f"{_fmt(d['llm_calls'])} |"
+            )
+
+        lines.append("\n### 分类路由分布\n")
+        lines.append("| 类别 | 运行 | 策略分布 | 匹配预期 | 不匹配 | 平均质量分 |")
+        lines.append("|---|---|---|---|---|---|")
+        for category, c in sorted(routing["by_category"].items()):
+            lines.append(
+                f"| {category} | {c['runs']} | {c['strategies']} | {c['matched']} | "
+                f"{c['mismatched']} | {_fmt(c['avg_quality'])} |"
+            )
+
+        if routing["mismatched_expected"]:
+            lines.append("\n### 误路由明细（预期与实际不一致）\n")
+            lines.append("| 任务 | 类别 | 预期 | 实际 | 规则策略 | 来源 | 路由理由 |")
+            lines.append("|---|---|---|---|---|---|---|")
+            for d in [*routing["over_routed"], *routing["under_routed"]]:
+                lines.append(
+                    f"| {d['task_id']} | {d['category']} | {d['expected_strategy']} | "
+                    f"{d['final_strategy']} | {d['rule_strategy']} | {d['route_source']} | "
+                    f"{_fmt_str(d['route_reason'])} |"
+                )
+        else:
+            lines.append("\n- 无误路由：所有题目的最终策略与预期策略一致。")
+
+    comparison = report.get("strategy_comparison") or {}
+    lines.append("\n## Auto 与强制策略的配对比较（同题同版本）\n")
+    if not comparison.get("tasks_compared"):
+        lines.append("- 本次未同时运行 auto 与 direct/react，无法配对比较。")
+    else:
+        lines.append(
+            f"- 可比任务 {comparison['tasks_compared']} 道；Auto 不劣于最佳强制策略（质量差 ≤ 0.05）"
+            f" {comparison['auto_not_worse']} 道；Auto 明显更差 {comparison['auto_worse']} 道；"
+            f"平均质量差 {_fmt(comparison['avg_gap'])}（Auto {_fmt(comparison['avg_auto_quality'])} vs "
+            f"最佳强制 {_fmt(comparison['avg_best_forced_quality'])}）"
+        )
+        eff = comparison.get("efficiency_when_comparable") or {}
+        if eff.get("paired_runs"):
+            lines.append(
+                f"- 质量相近（差 ≤0.05）的 {eff['paired_runs']} 对样本：Auto 平均 Token "
+                f"{_fmt(eff['avg_auto_tokens'])} vs 最佳强制 {_fmt(eff['avg_best_tokens'])}；"
+                f"Auto 平均耗时 {_fmt(eff['avg_auto_duration_ms'])}ms vs "
+                f"最佳强制 {_fmt(eff['avg_best_duration_ms'])}ms"
+            )
+        lines.append(
+            "\n| 任务 | Auto策略 | Auto质量 | Direct质量 | ReAct质量 | 最佳强制 | 差值 | Auto Token | 最佳Token | Auto耗时ms | 最佳耗时ms |"
+        )
+        lines.append("|---|---|---|---|---|---|---|---|---|---|---|")
+        for c in comparison["cases"]:
+            lines.append(
+                f"| {c['task_id']} | {c['auto_strategy']} | {_fmt(c['auto_quality'])} | "
+                f"{_fmt(c['direct_quality'])} | {_fmt(c['react_quality'])} | {c['best_forced']} | "
+                f"{_fmt(c['gap'])} | {_fmt(c['auto_tokens'])} | {_fmt(c['best_tokens'])} | "
+                f"{_fmt(c['auto_duration_ms'])} | {_fmt(c['best_duration_ms'])} |"
+            )
+
+    stats = report.get("call_stats") or {}
+    if stats:
+        lines.append("\n## 调用次数与开销（按配置）\n")
+        lines.append("| 配置 | 运行 | 平均LLM调用 | 平均工具调用 | 平均Token | 平均耗时ms |")
+        lines.append("|---|---|---|---|---|---|")
+        for variant, s in stats.items():
+            lines.append(
+                f"| {variant} | {s['runs']} | {_fmt(s['avg_llm_calls'])} | {_fmt(s['avg_tool_calls'])} | "
+                f"{_fmt(s['avg_tokens'])} | {_fmt(s['avg_duration_ms'])} |"
+            )
+        lines.append("- LLM 调用次数仅统计 Agent 侧 model_start 事件；复杂度路由与可选裁判的调用不计入。")
 
     lines.append("\n## 执行可靠性 & 资源开销（按配置）\n")
     lines.append(

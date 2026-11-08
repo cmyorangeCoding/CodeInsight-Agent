@@ -17,12 +17,17 @@ REQUIRED_FIELDS = (
     "id", "category", "question", "difficulty", "orchestration_complexity",
     "expected_answer", "required_facts", "required_evidence", "optional_evidence",
     "forbidden_or_unsupported_claims", "scoring_rubric",
+    # 路由评测元数据（作为分析参考，不是绝对正确答案）
+    "intent", "expected_strategy", "expected_strategy_reason",
 )
+
+#路由评测期望策略取值：只讨论默认自动路由覆盖的 Direct / ReAct
+ALLOWED_EXPECTED_STRATEGIES = {"direct", "react"}
 
 #编排复杂度取值：衡量「这题天然需要几次工具调用、跨几个文件」，与 difficulty（读懂难度）无关
 ALLOWED_ORCHESTRATION_COMPLEXITY = {"low", "medium", "high"}
 
-#评测集规范要求：一共 5 类，每类固定 5 条任务，合计 25 条
+#评测集规范要求：5 个基础类别各固定 5 条；multi_part_audit 为补充的综合类（数量不固定）
 EXPECTED_CATEGORIES = {
     "simple_lookup": 5,
     "cross_module_chain": 5,
@@ -95,6 +100,13 @@ def validate_dataset(tasks: list[dict], repo: Path | None = None) -> list[str]:
             problems.append(
                 f"{tid} orchestration_complexity 取值非法：{cplx!r}"
                 f"（应为 {sorted(ALLOWED_ORCHESTRATION_COMPLEXITY)}）"
+            )
+
+        expected_strategy = task.get("expected_strategy")
+        if expected_strategy is not None and expected_strategy not in ALLOWED_EXPECTED_STRATEGIES:
+            problems.append(
+                f"{tid} expected_strategy 取值非法：{expected_strategy!r}"
+                f"（应为 {sorted(ALLOWED_EXPECTED_STRATEGIES)}）"
             )
 
         if not task.get("required_facts"):

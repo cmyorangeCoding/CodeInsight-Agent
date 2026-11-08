@@ -221,8 +221,31 @@ class RouteDecision(BaseModel):
     # - "llm"：由LLM评估任务复杂度给出路由判断
     # - "forced"：外部强制指定策略（调试 / 手动覆盖场景）
     source: Literal["rule", "llm", "forced"] = "rule"
+    #最终采纳策略的置信度：source=rule 时为规则置信度，source=llm 时为 LLM 置信度
     confidence: float = 1.0 #可信度
     matched_signals: list[str] = Field(default_factory=list) #命中的特征信号列表，用来溯源
+
+    # ------------------------------ 审计字段（规则/模型/采纳结果分开记录）
+    # 规则建议：路由总是先跑规则，这几个字段必然有值（forced 时为空）
+    rule_strategy: Strategy | None = None
+    rule_confidence: float | None = None
+    rule_reason: str | None = None
+    rule_signals: list[str] = Field(default_factory=list)
+    # LLM 建议：仅在低置信度且启用 LLM 时有值；未咨询或调用失败时为 None
+    llm_strategy: Strategy | None = None
+    llm_confidence: float | None = None
+    llm_reason: str | None = None
+    # 采纳结果：
+    # - forced：外部强制指定
+    # - rule_only：规则高置信/未启用 LLM，直接采纳规则
+    # - rule_fallback：LLM 调用失败，回落规则
+    # - llm_agree：LLM 与规则一致，采纳（置信度取 LLM）
+    # - llm_upgrade：LLM 把规则档位升档（direct→react），采纳 LLM
+    # - llm_downgrade_blocked：LLM 建议降档被「只升不降」拦截，采纳规则
+    adoption: Literal[
+        "forced", "rule_only", "rule_fallback",
+        "llm_agree", "llm_upgrade", "llm_downgrade_blocked",
+    ] = "rule_only"
 
 
 # --------------------------------------------------------------------------- 验证
@@ -301,5 +324,12 @@ class RunRecord(BaseModel):
     plan_steps_completed: int = 0
     route_source: str | None = None
     route_reason: str | None = None
+    # 路由决策的可解释字段（auto 模式下用于评测规则/LLM 判断质量）
+    route_confidence: float | None = None
+    route_signals: list[str] = Field(default_factory=list)
+    # 规则建议 / LLM 建议 / 采纳结果（与 RouteDecision 审计字段对齐）
+    route_rule_strategy: str | None = None
+    route_llm_strategy: str | None = None
+    route_adoption: str | None = None
     limits: dict[str, Any] = Field(default_factory=dict)
     error: str | None = None

@@ -39,7 +39,10 @@ logs/
 # Orchestration / eval outputs (generated, not source)
 runs/
 evals/results/
-evals/reports/
+evals/reports/*
+# 人工撰写的评测结论要入库，自动生成的报告不入库
+!evals/reports/CONCLUSIONS.md
+!evals/reports/ROUTING_EVAL.md
 # evals/dataset/tasks.jsonl is the materialized dataset — committed as deliverable
 
 # OS

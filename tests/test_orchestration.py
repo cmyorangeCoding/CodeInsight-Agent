@@ -214,6 +214,72 @@ def test_forced_strategy_shortcircuits():
     assert decision.strategy == Strategy.DIRECT
 
 
+def test_route_decision_audit_fields_cover_all_adoption_paths():
+    """规则建议 / LLM 建议 / 采纳结果必须分开记录，不混在一起。"""
+    q = "请解释这个模块的依赖关系设计思路"  # 弱信号 → 规则 REACT(0.5)，会问 LLM
+
+    # forced：无规则/LLM 建议，采纳=forced
+    forced = ComplexityRouter(use_llm=False).route(q, force=Strategy.REACT)
+    assert forced.adoption == "forced"
+    assert forced.rule_strategy is None and forced.llm_strategy is None
+
+    # rule_only：高置信规则不问 LLM；规则审计字段与最终一致
+    only = ComplexityRouter(use_llm=False).route(q)
+    assert only.adoption == "rule_only"
+    assert only.rule_strategy == Strategy.REACT and only.rule_confidence == 0.5
+    assert only.llm_strategy is None and only.llm_confidence is None
+
+    # llm_agree：LLM 与规则一致 → 采纳，置信度取 LLM
+    agree = ComplexityRouter(
+        llm=FixedLLM(ComplexityVerdict(strategy="react", reason="同意", confidence=0.9))
+    ).route(q)
+    assert agree.adoption == "llm_agree"
+    assert agree.strategy == Strategy.REACT and agree.confidence == 0.9
+    assert agree.rule_strategy == Strategy.REACT and agree.llm_strategy == Strategy.REACT
+
+    # llm_upgrade：规则 direct(0.7，.py 路径) → LLM react，采纳 LLM
+    up_q = "app/orchestration/executor.py 里 run 方法做了什么？"
+    up = ComplexityRouter(
+        llm=FixedLLM(ComplexityVerdict(strategy="react", reason="要追踪", confidence=0.7))
+    ).route(up_q)
+    assert up.rule_strategy == Strategy.DIRECT
+    assert up.llm_strategy == Strategy.REACT
+    assert up.adoption == "llm_upgrade" and up.strategy == Strategy.REACT
+
+    # llm_downgrade_blocked：LLM 想降级被拦截，最终置信度取规则而非 LLM
+    blocked = ComplexityRouter(
+        llm=FixedLLM(ComplexityVerdict(strategy="direct", reason="看着简单", confidence=0.95))
+    ).route(q)
+    assert blocked.adoption == "llm_downgrade_blocked"
+    assert blocked.strategy == Strategy.REACT
+    assert blocked.confidence == 0.5  # 规则置信度，而不是 LLM 的 0.95
+    assert blocked.llm_confidence == 0.95  # LLM 自己的置信度单独保留
+
+    # rule_fallback：LLM 抛异常 → 回落规则
+    class BoomLLM:
+        def with_structured_output(self, schema):
+            raise RuntimeError("boom")
+
+    fallback = ComplexityRouter(llm=BoomLLM()).route(q)
+    assert fallback.adoption == "rule_fallback"
+    assert fallback.strategy == Strategy.REACT
+    assert fallback.llm_strategy is None
+
+
+def test_search_code_tool_accepts_query_alias():
+    """模型偶发用 query 调 search_code，不能再抛 TypeError。"""
+    from app.tools.repository_tools import SearchCodeTool
+
+    class FakeProvider:
+        def search_code(self, keyword, max_results, context_lines):
+            return []
+
+    tool = SearchCodeTool(provider=FakeProvider())
+    assert "没有找到关键词" in tool._run(keyword="get_llm")
+    assert "没有找到关键词" in tool._run(query="get_llm")  # 别名兼容
+    assert "缺少检索关键词" in tool._run()  # 两者都缺时返回可恢复提示而非异常
+
+
 def test_orchestrator_uses_injected_routing_llm():
     """复杂度路由应使用注入的轻量模型；未注入时回退主模型。"""
     main_llm = FixedLLM(ComplexityVerdict(strategy="direct", reason="main", confidence=0.6))
@@ -814,6 +880,86 @@ def test_report_flags_anomalies_without_dropping_them():
     md = run_eval.render_markdown(report)
     assert "异常样本（保留，未删除）" in md
     assert "| b |" in md
+
+
+def test_eval_config_has_auto_variant_using_real_router():
+    from evals import config as eval_config
+    from evals.run_eval import _FORCE_MAP
+
+    assert "auto" in eval_config.VARIANTS
+    # force 为空字符串 → _FORCE_MAP.get("") 为 None → 走真实自动路由
+    assert eval_config.VARIANTS["auto"]["force"] == ""
+    assert _FORCE_MAP.get(eval_config.VARIANTS["auto"]["force"]) is None
+
+
+def _route_row(task_id, category, variant, rule, final, source, expected, quality,
+               tokens=100, tools=2, llm=3, duration_ms=1000):
+    return {
+        "task_id": task_id, "category": category, "intent": "定位查询",
+        "variant": variant, "repeat": 0, "strategy": final,
+        "route": {"strategy": final, "source": source, "confidence": 1.0,
+                  "reason": f"route-{task_id}", "matched_signals": []},
+        "rule_route": {"strategy": rule, "confidence": 0.5, "signals": [], "reason": "rule"},
+        "expected_strategy": expected, "llm_call_count": llm,
+        "answer": "answer", "error": None,
+        "record": _record(task_id, strategy=final, duration_ms=duration_ms,
+                          total_tokens=tokens, tool_call_count=tools).model_dump(),
+        "plan": None, "verification": None,
+        "score": {"task_id": task_id, "category": category, "strategy": final,
+                  "variant": variant, "repeat": 0, "completed": True,
+                  "quality_score": quality, "evidence_coverage": 0.5},
+    }
+
+
+def test_routing_analysis_flags_over_routing_and_rule_transitions():
+    from evals import run_eval
+
+    rows = [
+        _route_row("a", "simple_lookup", "auto", "direct", "react", "rule", "direct", 0.5),
+        _route_row("a", "simple_lookup", "direct", "direct", "direct", "forced", "direct", 0.9),
+        _route_row("a", "simple_lookup", "react", "direct", "react", "forced", "direct", 0.5),
+        _route_row("b", "architecture", "auto", "react", "react", "rule", "react", 0.9),
+        _route_row("b", "architecture", "direct", "react", "direct", "forced", "react", 0.4),
+        _route_row("b", "architecture", "react", "react", "react", "forced", "react", 0.9),
+    ]
+    report = run_eval.build_report(rows, ["a", "b"], ["auto", "direct", "react"],
+                                   started_at="s", finished_at="f", notes=[])
+
+    routing = report["routing"]
+    assert routing["auto_runs"] == 2
+    assert routing["by_source"] == {"rule": 2}
+    assert [d["task_id"] for d in routing["over_routed"]] == ["a"]
+    assert routing["under_routed"] == []
+    assert routing["matched_expected"] == 1
+    assert routing["low_confidence_rule_count"] == 2
+    # 规则=react、最终=react：没有发生任何降级（当前只升不降）
+    assert routing["downgraded_by_llm"] == 0
+
+    comparison = report["strategy_comparison"]
+    assert comparison["tasks_compared"] == 2
+    assert comparison["auto_worse"] == 1
+    assert comparison["auto_not_worse"] == 1
+    assert comparison["cases"][0]["task_id"] == "a"
+    assert comparison["cases"][0]["best_forced"] == "direct"
+
+    stats = report["call_stats"]
+    assert stats["auto"]["avg_llm_calls"] == 3
+
+    md = run_eval.render_markdown(report)
+    assert "路由决策分析（Auto）" in md
+    assert "过度路由（预期 direct → 实际 react）1" in md
+    assert "误路由明细" in md
+
+
+def test_dataset_tasks_carry_routing_metadata():
+    from evals.dataset import load_tasks
+
+    tasks = load_tasks()
+    assert tasks
+    for task in tasks:
+        assert task["expected_strategy"] in {"direct", "react"}, task["id"]
+        assert task["intent"], task["id"]
+        assert task["expected_strategy_reason"], task["id"]
 
 
 # =========================================================================== 14. 现有功能不退化
