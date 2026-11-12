@@ -84,6 +84,9 @@ CREATE TABLE IF NOT EXISTS public.runs (
     updated_at           timestamp without time zone NOT NULL,
     events_json          text,
     -- 断点恢复（2026-11 增量）
+    -- thread_id 是 LangGraph 线程命名空间键（由 task_thread_id() 归一化），
+    -- 与 task_id 分开存：当前取值相同，但自定义 task_id / 上下文重置 / 租户前缀
+    -- 都只影响线程，不影响业务任务 ID。
     thread_id            character varying(64),
     requested_strategy   character varying(32),
     user_id              character varying(64),

@@ -26,6 +26,11 @@ def task_thread_id(task_id: str) -> str:
     一个任务（多轮会话）只对应一条线程，同一任务的所有轮次共用它，
     这样多轮上下文与断点恢复都以「任务」为单位。
     迁移前的历史任务 task_id == run_id，直接复用原有线程，避免断链。
+
+    thread_id 不是 task_id 的重复列：它是 LangGraph checkpoint 的命名空间键，
+    统一由这个函数生成。当前对后端生成的 task_id 是 1:1 归一化，所以两者取值相同；
+    但客户端自定义 task_id、将来加租户/环境前缀或做任务内上下文重置时，
+    只需改这个映射（或换线程），业务任务 ID 不受影响。
     """
     return task_id if task_id.startswith(("task-", "run-")) else f"task-{task_id}"
 

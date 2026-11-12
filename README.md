@@ -194,6 +194,8 @@ flowchart LR
 
 不再有独立的 `conversation_thread_id`。任务的 checkpoint 线程本身就是会话上下文：第 N 轮直接在第 N-1 轮的 checkpoint 上追加消息，不需要把历史消息复制进另一个线程。`runs.requested_thread_id` 列已废弃，新代码不再读写。
 
+`runs` 同时保留 `task_id` 与 `thread_id`，不是冗余：`task_id` 是业务任务 ID，`thread_id` 是 LangGraph 的线程命名空间键，由 `task_thread_id()` 统一归一化生成。后端生成的 `task_id` 会让两者取值相同（`thread_id = task-{task_id}`），但保留独立一列意味着：客户端自定义的 `task_id` 可按规定映射成线程、将来加租户/环境前缀或做「任务内重置上下文」时只换线程不换任务，业务 ID 都不需要迁移。
+
 因为一条线程被多轮共用，恢复时必须判断「最新 checkpoint 是不是本轮写的」。写入时通过 `config.metadata = {"run_id": ...}` 记录归属（LangGraph 会把 metadata 随 checkpoint 一起持久化），恢复时读取最新 checkpoint 的 `metadata.run_id`：
 
 - **等于本轮** → 本轮已写入：`state.next` 非空则 `invoke(None)` 续跑；为空则本轮已跑完，只补终态；

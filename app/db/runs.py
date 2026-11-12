@@ -87,8 +87,14 @@ class Run(Base):
     events_json = Column(Text, nullable=True, comment="执行事件流 JSON 快照")
 
     # ---------------- 断点恢复相关（2026-11 增量） ----------------
+    # thread_id 不是 task_id 的重复列：它是 LangGraph checkpoint 的线程命名空间键。
+    # 当前 task_thread_id() 对后端生成的 task_id 做 1:1 归一化（task-{task_id}），
+    # 所以取值看起来和 task_id 一样；单独留一列是为了：
+    #   1) 客户端可传自定义 task_id，由 task_thread_id() 统一加前缀/归一化，
+    #      业务任务 ID 不必绑死在 checkpoint 的命名规则上；
+    #   2) 未来做「任务内重置上下文」或租户/环境隔离时，只换线程不换任务。
     thread_id = Column(String(64), nullable=True,
-                       comment="LangGraph 任务线程 ID（task-{task_id}，同任务多轮共用）")
+                       comment="LangGraph 线程命名空间键（当前 task-{task_id}，同任务多轮共用）")
     requested_strategy = Column(String(32), nullable=True,
                                 comment="创建任务时请求的策略（auto/direct/react/plan）")
     user_id = Column(String(64), nullable=True, comment="用户标识（长期记忆隔离用）")
