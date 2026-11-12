@@ -12,17 +12,17 @@ CodeInsight-Agent 是一个「代码仓库理解」方向的 LLM Agent 项目。
 
 ![主界面](docs/images/01-home.png)
 
-![仓库配置](docs/images/02-repo-config.png)
+![本地仓库配置](docs/images/02-repo-config.png)
 
-### 执行过程与代码证据
+![GitHub 仓库配置](docs/images/03-github-config.png)
 
-![执行进度](docs/images/03-progress.png)
+### 任务内多轮对话
 
-![代码证据](docs/images/04-evidence.png)
+![任务内多轮对话](docs/images/04-chat-turns.png)
 
-### 最终回答
+### 执行过程与最终回答
 
-![最终回答](docs/images/05-answer.png)
+![执行进度、代码证据与最终回答](docs/images/05-progress-answer.png)
 
 ---
 
