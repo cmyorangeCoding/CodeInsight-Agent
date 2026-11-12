@@ -181,19 +181,19 @@ TASKS: list[dict] = [
         "difficulty": "medium",
         "orchestration_complexity": "high",
         "question": "从 Web API 入口收到用户提问，到真正调用大模型，请给出完整调用链（涉及哪些文件与函数）。",
-        "expected_answer": "app/api/main.py 的 _run_orchestrator_sync() 创建 TokenBudget/Tracer/retriever 后统一装配 "
+        "expected_answer": "app/api/run_executor.py 的 execute_run() 创建 TokenBudget/Tracer/retriever 后统一装配 "
                            "app/orchestration/executor.py 的 Orchestrator：经复杂度路由（auto 仅在 direct/react "
                            "间选择，plan 仅手动启用）后由 agent_factory(mode) 调用 create_agent 组装 Agent。"
                            "模型实例来自 get_llm()（app/models/llm.py）的 ChatOpenAI，最终 agent.invoke(...) "
                            "触发真正的模型调用。原命令行入口与 baseline 单 Agent 分支均已移除。",
         "required_facts": [
-            {"text": "入口 app/api/main.py 的 _run_orchestrator_sync", "any_of": ["app/api/main.py", "_run_orchestrator_sync"]},
+            {"text": "入口 app/api/run_executor.py 的 execute_run", "any_of": ["app/api/run_executor.py", "execute_run"]},
             {"text": "编排层 Orchestrator", "any_of": ["Orchestrator", "编排"]},
             {"text": "create_agent 组装", "any_of": ["create_agent"]},
             {"text": "get_llm → ChatOpenAI", "any_of": ["get_llm"]},
         ],
         "required_evidence": [
-            {"file_path": "app/api/main.py", "symbol": "_run_orchestrator_sync",
+            {"file_path": "app/api/run_executor.py", "symbol": "execute_run",
              "anchor": "orchestrator = Orchestrator(",
              "note": "编排层装配点"},
             {"file_path": "app/orchestration/executor.py", "symbol": "Orchestrator",
@@ -861,16 +861,16 @@ TASKS: list[dict] = [
         "orchestration_complexity": "high",
         "question": "单次输入 Token 上限（max_input_tokens）在项目里一共有几个配置点？当前取值分别是多少？"
                     "超出时抛出的异常类定义在哪个文件？请枚举全部配置点，不要遗漏。",
-        "expected_answer": "共两个配置点：app/api/main.py 的 TokenBudget(max_input_tokens=60000) 与 "
+        "expected_answer": "共两个配置点：app/api/run_executor.py 的 TokenBudget(max_input_tokens=60000) 与 "
                            "evals/config.py 的 MAX_INPUT_TOKENS = 60_000（评估运行器使用）。超出时抛出 "
                            "TokenBudgetExceededError，该异常类定义在 app/observability/budget_middleware.py。",
         "required_facts": [
-            {"text": "app/api/main.py 配置 60000", "any_of": ["60000", "60_000"]},
+            {"text": "app/api/run_executor.py 配置 60000", "any_of": ["60000", "60_000"]},
             {"text": "evals/config.py 也有一处配置", "any_of": ["evals/config.py", "MAX_INPUT_TOKENS"]},
             {"text": "异常定义在 app/observability/budget_middleware.py", "any_of": ["budget_middleware"]},
         ],
         "required_evidence": [
-            {"file_path": "app/api/main.py", "symbol": "_run_orchestrator_sync",
+            {"file_path": "app/api/run_executor.py", "symbol": "execute_run",
              "anchor": "max_input_tokens=60000,", "note": "Web 后端预算配置"},
             {"file_path": "evals/config.py", "symbol": "MAX_INPUT_TOKENS",
              "anchor": "MAX_INPUT_TOKENS = 60_000", "note": "评估侧预算配置"},

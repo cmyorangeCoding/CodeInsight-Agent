@@ -11,7 +11,7 @@ SpringBoot 对照：
 """
 from __future__ import annotations
 
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, text
 from sqlalchemy.orm import DeclarativeBase, sessionmaker
 
 from app.config import settings
@@ -20,12 +20,19 @@ from app.config import settings
 # ------------------------------- Engine -------------------------------
 # 全局唯一 engine，生命周期等于整个 FastAPI 进程
 # pool_pre_ping=True：每次取连接先 ping 一下，PostgreSQL 重启后自动恢复
-engine = create_engine(
-    settings.db.url,
-    pool_pre_ping=True,
-    pool_size=5,
-    max_overflow=10,
-    echo=False,  # True 会打印所有 SQL，调试时开
+#
+# 没有配置 DATABASE_URL 时不创建 engine（纯单元测试 / 本地无库降级场景），
+# 此时需要持久化的功能（runs / run_events / 任务恢复）会显式抛错或跳过。
+engine = (
+    create_engine(
+        settings.db.url,
+        pool_pre_ping=True,
+        pool_size=5,
+        max_overflow=10,
+        echo=False,  # True 会打印所有 SQL，调试时开
+    )
+    if settings.db.url
+    else None
 )
 
 
@@ -46,6 +53,11 @@ class Base(DeclarativeBase):
     pass
 
 
+def db_available() -> bool:
+    """是否配置了数据库（不代表连接可用，只代表有连接串）。"""
+    return engine is not None
+
+
 # ------------------------------- 依赖注入 -------------------------------
 def get_db():
     """FastAPI 依赖注入：每个请求拿一个 Session，请求结束自动关闭。
@@ -55,6 +67,8 @@ def get_db():
         def list_runs(db: Session = Depends(get_db)):
             ...
     """
+    if engine is None:
+        raise RuntimeError("DATABASE_URL 未配置，数据库功能不可用")
     db = SessionLocal()
     try:
         yield db
@@ -63,26 +77,48 @@ def get_db():
 
 
 # ------------------------------- 表自动创建 -------------------------------
-def init_tables() -> None:
-    """启动时确保所有 ORM 对应的表存在（CREATE TABLE IF NOT EXISTS）。
+# runs 表在 2026-11 的断点恢复改造中新增的列。
+# create_all 不会给已存在的表补列，这里用 ADD COLUMN IF NOT EXISTS 做增量迁移。
+_RUNS_NEW_COLUMNS = [
+    ("thread_id", "VARCHAR(64)"),
+    ("requested_thread_id", "VARCHAR(128)"),
+    ("requested_strategy", "VARCHAR(32)"),
+    ("user_id", "VARCHAR(64)"),
+    ("attempt", "INTEGER NOT NULL DEFAULT 0"),
+    ("worker_id", "VARCHAR(64)"),
+    ("lease_until", "TIMESTAMP"),
+    ("cancel_requested", "BOOLEAN NOT NULL DEFAULT FALSE"),
+    ("last_error", "TEXT"),
+]
 
-    注意：只有被 import 进来的实体类才会被 Base 注册，
-    所以这里需要先 import 所有 models 模块。
-    """
-    from sqlalchemy import text
+
+def init_tables() -> None:
+    """启动时确保所有 ORM 对应的表存在（CREATE TABLE IF NOT EXISTS）。"""
+    if engine is None:
+        print("[db] DATABASE_URL 未配置，跳过建表与迁移")
+        return
 
     from app.db.runs import Run  # noqa: F401 — 触发 ORM 注册
+    from app.db.run_events import RunEventRecord  # noqa: F401
+    from app.db.tool_executions import ToolExecutionRecord  # noqa: F401
 
     Base.metadata.create_all(bind=engine)
 
-    # 兼容：如果 runs 表是老版本（没 events_json 列），create_all 不会给已有表加新列，
-    # 需要手动 ALTER TABLE 补上。try/except 兜底：列已存在就忽略错误。
-    try:
-        with engine.connect() as conn:
-            conn.execute(text(
-                "ALTER TABLE runs ADD COLUMN events_json TEXT NULL"
-            ))
-            conn.commit()
-    except Exception:
-        # 列已存在或表不存在（create_all 刚创建的）都正常，忽略
-        pass
+    # 增量迁移：兼容改造前已有的 runs 表
+    with engine.connect() as conn:
+        for column, ddl in _RUNS_NEW_COLUMNS:
+            try:
+                conn.execute(text(f"ALTER TABLE runs ADD COLUMN IF NOT EXISTS {column} {ddl}"))
+                conn.commit()
+            except Exception as exc:  # noqa: BLE001 - 列已存在 / 方言不支持都忽略
+                print(f"[db] WARNING: add column runs.{column} failed: {exc}")
+                conn.rollback()
+        for ddl in (
+            "CREATE INDEX IF NOT EXISTS idx_runs_status_lease ON runs (status, lease_until)",
+            "CREATE INDEX IF NOT EXISTS idx_run_events_run_seq ON run_events (run_id, sequence)",
+        ):
+            try:
+                conn.execute(text(ddl))
+                conn.commit()
+            except Exception:  # noqa: BLE001
+                conn.rollback()

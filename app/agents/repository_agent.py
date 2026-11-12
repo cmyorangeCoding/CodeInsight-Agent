@@ -163,6 +163,12 @@ def build_repository_tools(
             SearchUserMemoryTool(memory=memory),
         ])
 
+    # 副作用工具幂等包装：任务恢复后重复调用时回放结果，避免重复写入长期记忆。
+    # 只读工具保持原样，恢复时允许重新执行。
+    from app.tools.idempotency import guard_tool
+
+    tools = [guard_tool(t) for t in tools]
+
     return tools, memory
 
 

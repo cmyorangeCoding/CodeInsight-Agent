@@ -83,7 +83,8 @@ class RunEvent(BaseModel):
 
 # --------------------------------------------------------------------------- 任务状态
 # 任务状态枚举
-RunStatus = Literal["pending", "running", "completed", "failed", "cancelled"]
+# recovering：崩溃后已被恢复调度器认领、正在准备从 checkpoint 续跑的中间态
+RunStatus = Literal["pending", "running", "recovering", "completed", "failed", "cancelled"]
 
 
 @dataclass
@@ -95,6 +96,9 @@ class RunState:
     repo_source: str = "local"       # local / github
     repo_identifier: str = ""        # 本地路径或 "owner/repo"
     repository_id: str = ""          # 仓库唯一资源id
+    thread_id: str = ""              # LangGraph 执行线程（run-{run_id}），恢复时复用
+    attempt: int = 0                 # 已执行/恢复次数
+    worker_id: str | None = None     # 当前执行者
     answer: str = ""
     strategy: str | None = None      # 当前选中的路由/编排策略名称
     start_time: float = 0.0

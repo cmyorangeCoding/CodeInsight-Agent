@@ -88,7 +88,7 @@ CodeInsight-Agent 是一个「代码仓库理解」方向的 LLM Agent 项目。
 
 ### 6. 短期 + 长期记忆
 
-- **短期记忆**：LangGraph `PostgresSaver` checkpointer，按 `repo-{repository_id}` 固定 `thread_id`，同一仓库的多次提问自动续接上下文，不同仓库完全隔离。
+- **短期记忆**：LangGraph `PostgresSaver` checkpointer。执行线程 `execution_thread_id = run-{run_id}` 每个任务独立、可精确恢复；会话上下文由 `conversation_thread_id`（默认 `repo-{repository_id}`）承载，只用于加载历史消息，不写入执行线程。同一仓库多轮提问仍然连续，不同任务之间互不干扰。
 - **长期记忆**：`PostgresStore` 向量记忆库，保存用户偏好与项目事实，通过中间件在每轮请求中按需注入系统提示词。
 - 工具集提供 `search_project_memory` / `search_user_memory` / `save_long_term_memory`，由模型判断何时读写。
 
@@ -96,7 +96,11 @@ CodeInsight-Agent 是一个「代码仓库理解」方向的 LLM Agent 项目。
 
 每次任务的问题、回答、状态、策略、耗时与完整事件链路都会写入 PostgreSQL。前端按仓库分组展示历史，并可直接恢复当时的执行进度与代码证据。
 
-### 8. 自带评测体系
+### 8. 业务任务断点恢复
+
+每个 Run 使用独立的 `run-{run_id}` 执行线程，执行状态由 LangGraph checkpoint 持续落库。服务崩溃重启后，`RecoveryScheduler` 会自动扫描租约过期的未完成任务，通过数据库原子认领取得执行权，并用原 `thread_id` 从最近 checkpoint 续跑。无法安全恢复的任务会被明确标记为 `failed` 并记录原因，不会静默重跑整个任务。详见[业务任务断点恢复](#业务任务断点恢复)。
+
+### 9. 自带评测体系
 
 `evals/` 提供任务数据集、评分器、对比运行器与报告产出，可复现不同编排策略在真实仓库问题上的质量、耗时与 token 消耗。
 
@@ -118,6 +122,8 @@ CodeInsight-Agent 是一个「代码仓库理解」方向的 LLM Agent 项目。
 | Token 预算控制 | 总预算、单次输入、输出预留三重约束 |
 | 长期记忆 | 用户偏好、项目事实的保存与检索 |
 | 历史任务 | 按仓库分组、详情回看、事件回放、删除 |
+| 断点恢复 | 崩溃重启后自动认领未完成任务，从 LangGraph checkpoint 续跑 |
+| 事件续传 | SSE 按 sequence / `Last-Event-ID` 补发历史事件，重启不丢进度 |
 | GitHub Token 配置 | 前端可直接保存，无需重启后端 |
 | 评测与报告 | 数据集校验、策略对比、结果报告 |
 
@@ -143,7 +149,11 @@ flowchart LR
     VF --> O
     O -->|Tracer 事件| TM
     TM -->|SSE| U
-    O --> DB[(runs 历史表)]
+    O --> DB[(runs / run_events<br/>tool_executions)]
+    RS[RecoveryScheduler] -->|扫描过期租约| DB
+    RS -->|原子认领 + resume| TM
+    CP[(LangGraph checkpoints)] --> O
+    O --> CP
 ```
 
 ### 分层说明
@@ -151,14 +161,14 @@ flowchart LR
 | 层 | 目录 | 职责 |
 |---|---|---|
 | 前端展示层 | `web/` | Vue 3 + Vite + TypeScript，SSE 订阅、Markdown/代码高亮、历史回看 |
-| API 层 | `app/api/` | FastAPI 路由、任务管理、SSE 事件流、历史 CRUD |
+| API 层 | `app/api/` | FastAPI 路由、任务管理、统一执行入口、恢复调度、SSE 事件流、历史 CRUD |
 | 编排层 | `app/orchestration/` | 复杂度路由、计划生成、执行器、验证器、证据收集、运行记录 |
 | Agent / 工具层 | `app/agents/`、`app/tools/` | LangChain Agent、仓库工具、记忆工具 |
 | 检索层 | `app/rag/` | 切片、增量索引、向量/关键词混合检索 |
 | 仓库访问层 | `app/repository/`、`app/mcp/` | 本地 Provider、GitHub Provider、GitHub MCP 客户端 |
 | 记忆层 | `app/memory/` | 短期 checkpointer、长期向量记忆、偏好上下文注入 |
 | 观测层 | `app/observability/` | Tracer、TokenBudget、预算中间件、回调 |
-| 持久化层 | `app/db/` | runs 表 ORM 与 DAO |
+| 持久化层 | `app/db/` | runs / run_events / tool_executions 的 ORM 与 DAO |
 
 ### 一次请求的执行流程
 
@@ -168,7 +178,88 @@ flowchart LR
 4. 复杂度路由器决定 `direct` / `react` / `plan_execute`。
 5. Agent 通过 RAG 检索、grep、`read_file`、记忆工具收集证据。
 6. 编排层汇总证据并生成最终回答；复杂策略额外经过 Verifier 校验。
-7. 执行事件实时推送，任务结束后回答与事件快照写入 `runs` 表。
+7. 执行事件先写入 `run_events` 再实时推送；任务结束后回答与事件快照写入 `runs` 表。
+
+---
+
+## 业务任务断点恢复
+
+### 两类线程 ID
+
+| 概念 | 取值 | 作用 |
+|---|---|---|
+| `execution_thread_id` | `run-{run_id}` | 承载当前任务的 LangGraph checkpoint，任务之间完全隔离，是恢复执行的唯一依据 |
+| `conversation_thread_id` | 前端传入的 `thread_id`，缺省 `repo-{repository_id}` | 只用于加载历史会话上下文（最近若干轮 Human/AI 消息），不写入执行线程 |
+
+首次执行时把会话上下文作为 `initial_messages` 注入，再拼接用户问题；恢复执行不再注入问题、不开启新一轮对话，而是直接用 `invoke(None)` 从执行线程的 checkpoint 续跑。
+
+### 恢复流程
+
+```mermaid
+flowchart TD
+    S[服务启动] --> I[init_tables 增量迁移<br/>runs 新列 + run_events + tool_executions]
+    I --> R[RecoveryScheduler 立即扫描一轮]
+    R --> Q{status ∈ pending/running/recovering<br/>且租约为空或已过期?}
+    Q -->|否| W[按 RECOVERY_INTERVAL 周期重扫]
+    Q -->|是| C[数据库原子认领<br/>条件 UPDATE + rowcount]
+    C -->|认领失败| W
+    C -->|认领成功| T{存在 thread_id?}
+    T -->|否| F[标记 failed：旧版本任务无法恢复]
+    T -->|是| P{策略是否 direct/react?}
+    P -->|否| F2[标记 failed：plan_execute 无 checkpoint 可恢复]
+    P -->|是| K{checkpoints 表存在该线程记录?}
+    K -->|是| RS[以 resume=True 提交线程池<br/>invoke(None) 从断点续跑]
+    K -->|否| E{该 run 有执行事件?}
+    E -->|无| FR[以 resume=False 首次执行]
+    E -->|有| F3[标记 failed：无 checkpoint 且已有执行事件]
+    RS --> X[execute_run 续租 + 事件先落库后推送]
+    FR --> X
+    X --> Z{completed / failed / cancelled}
+```
+
+关键约束：
+
+- **不依赖内存变量伪装恢复**：恢复判定完全来自数据库（`status`、`lease_until`、`thread_id`、`checkpoints` 表、`run_events` 计数）。
+- **不会直接重提所有 running 任务**：只有租约缺失或过期的任务才可能被认领；原 Worker 仍在续租时，其它进程无法抢占。
+- **恢复幂等**：认领是条件 UPDATE，重复扫描不会重复提交；`run_manager.is_inflight` 额外挡住本进程内的重复提交。
+- **终态不可恢复**：`completed` / `failed` / `cancelled` 不进入扫描，也不会被覆盖。
+- **Plan 明确不支持 checkpoint 恢复**：`plan_execute` 的分步 Agent 未接 checkpointer，恢复会被标记 `failed` 并写入原因，而不是悄悄重跑整个任务。
+
+### 状态流转
+
+```text
+pending ──claim──> running ──finish──> completed
+   │                  │
+   │                  ├──finish──> failed
+   │                  └──finish──> cancelled
+   └──claim──> recovering ──claim/resume──> running ──> ...
+                    └──fail_unrecoverable──> failed
+```
+
+`recovering` 只表示「已被恢复调度器认领、正在决定续跑还是失败」，最终仍回到 `running` 或终态。所有终态写入都带 `worker_id` 与「非终态」条件：旧 Worker 在丢失租约后才完成任务时，`finish` 返回 False，不会覆盖新 Worker 的结果；取消与完成同时发生时也只有一方生效。
+
+### 任务认领与租约
+
+- **认领**：`UPDATE runs SET status=..., worker_id=..., lease_until=..., attempt=attempt+1 WHERE run_id=... AND (租约为空或已过期)`，以 `rowcount == 1` 判定成功。
+- **续租**：`LeaseRenewer` 后台线程按 `RUN_LEASE_SECONDS / 3` 周期续租；续租失败即认为失去执行权，后续不再写终态。
+- **接管**：Worker 崩溃后租约到期，其它进程（或重启后的自己）才能认领。
+- 保护全部落在数据库条件更新上，SQLite / PostgreSQL 均可工作，不依赖 Python 进程内的锁。
+
+### 工具执行的幂等保障
+
+- **只读工具**（检索、grep、读文件等）不做包装，恢复时允许重新执行。
+- **有副作用工具**（当前为 `save_long_term_memory`）由 `GuardedTool` 包装，以 `run_id + tool_name + 参数摘要(SHA-256)` 作为幂等键写入 `tool_executions`：
+  - 命中 `completed` → 直接返回上次结果，不再执行；
+  - 未命中 → 先写 `running`，成功后写 `completed`；
+  - 执行异常 → 写 `failed` 并抛出，恢复时可重试。
+- 这能消除「恢复后重复执行已成功工具」的大部分情况，但**不是 exactly-once**：副作用已经发生、`completed` 尚未写库时进程崩溃，恢复后仍可能重放一次。该窗口无法在应用层彻底消除，需要工具自身幂等或外部去重配合。
+
+### SSE 事件持久化与续传
+
+- 所有事件经 `RunEventPublisher.emit` **先写入 `run_events`（sequence 单调递增），再进入内存队列推送**；数据库不可用时降级为仅内存推送。
+- `GET /api/runs/{run_id}/events` 支持三种游标：`?after=N`、`?last_sequence=N`、标准 `Last-Event-ID` 头。服务端先补发 `sequence > N` 的历史事件，再衔接实时队列，并按 sequence 去重。
+- 每条 SSE 事件带 `id: <sequence>`；任务进入终态后会补发剩余事件、发送 `run_status` 终止事件再关闭连接。
+- `events_json` 仍保留为任务完成后的完整快照，历史回放接口无需改动。
 
 ---
 
@@ -189,18 +280,21 @@ flowchart LR
 
 ## 数据库结构
 
-完整建表脚本见 [db/schema.sql](db/schema.sql)，共 10 张表，分四组：
+完整建表脚本见 [db/schema.sql](db/schema.sql)，共 12 张表，分六组：
 
 | 分组 | 表 | 用途 |
 |---|---|---|
 | RAG 索引 | `code_chunks` | 代码切片 + 1024 维向量 + 全文检索列 `content_tsv` |
-| 历史任务 | `runs` | 仓库路径、问题、最终回答、耗时、事件快照 `events_json` |
-| 短期记忆 | `checkpoints`、`checkpoint_blobs`、`checkpoint_writes`、`checkpoint_migrations` | LangGraph checkpointer，按 `repo-{repository_id}` 保存对话线程状态 |
+| 历史任务 | `runs` | 仓库路径、问题、回答、耗时、事件快照 `events_json`，以及 `thread_id` / `attempt` / `worker_id` / `lease_until` / `last_error` 等恢复字段 |
+| 任务事件 | `run_events` | 逐条持久化的执行事件，`(run_id, sequence)` 唯一，支持崩溃补发与 SSE 续传 |
+| 工具幂等 | `tool_executions` | 有副作用工具的幂等键、执行状态与结果 |
+| 短期记忆 | `checkpoints`、`checkpoint_blobs`、`checkpoint_writes`、`checkpoint_migrations` | LangGraph checkpointer，按 `run-{run_id}` 保存每个任务的执行状态 |
 | 长期记忆 | `store`、`store_vectors`、`store_migrations`、`vector_migrations` | PostgresStore 保存用户偏好 / 项目事实，并对文本做向量检索 |
 
-- **短期记忆**保存「对话进行到哪一步」，负责同一仓库的多轮提问续接，不同仓库完全隔离。
+- **短期记忆**分为两层：`execution_thread_id` 保存「单个任务执行到哪一步」，用于崩溃恢复；`conversation_thread_id` 只作为会话上下文来源，不写入执行线程。
 - **长期记忆**保存「跨会话仍然有用的信息」，由 Agent 通过记忆工具按需读写。
-- **历史任务**的 `events_json` 与实时 SSE 事件格式一致，历史回看时直接复用前端渲染逻辑，执行进度与代码证据可完整恢复。
+- **任务事件**逐条落库，是服务重启后事件补发的依据；**历史任务**的 `events_json` 与实时 SSE 事件格式一致，历史回看时直接复用前端渲染逻辑。
+- 增量迁移见 [db/migrations/20261111_run_recovery.sql](db/migrations/20261111_run_recovery.sql)；同时 `init_tables()` 会在启动时用 `ADD COLUMN IF NOT EXISTS` 补齐字段，兼容已有历史数据。
 
 ---
 
@@ -320,6 +414,10 @@ npm run dev
 | `WEB_HOST` / `WEB_PORT` | 否 | 后端监听地址，默认 `0.0.0.0:8000` |
 | `TASK_TIMEOUT` | 否 | 单任务超时秒数，默认 `300` |
 | `MAX_CONCURRENT_TASKS` | 否 | 同时执行的任务数，默认 `5` |
+| `RUN_LEASE_SECONDS` | 否 | 任务执行租约秒数，默认 `90`；Worker 崩溃后需等租约过期才能被接管 |
+| `RECOVERY_ENABLED` | 否 | 是否启用启动 / 周期恢复调度，默认 `true` |
+| `RECOVERY_INTERVAL_SECONDS` | 否 | 恢复调度扫描间隔，默认 `30` |
+| `RECOVERY_BATCH` | 否 | 单轮最多扫描任务数，默认 `10` |
 | `CODEINSIGHT_CLONE_WORKSPACE` | 否 | GitHub 浅克隆工作区，默认 `~/.codeinsight/workspace` |
 | `CLONE_CLEANUP_THRESHOLD_MB` | 否 | 工作区清理阈值，默认 `500` |
 
@@ -334,14 +432,16 @@ npm run dev
 | `POST` | `/api/config` | 保存 / 清除 GitHub Token |
 | `POST` | `/api/runs` | 创建分析任务，返回 `run_id` |
 | `GET` | `/api/runs/{run_id}` | 查询任务状态与最终回答 |
-| `GET` | `/api/runs/{run_id}/events` | SSE 事件流 |
+| `GET` | `/api/runs/{run_id}/events` | SSE 事件流（支持 `?after=` / `?last_sequence=` / `Last-Event-ID` 续传） |
 | `POST` | `/api/runs/{run_id}/cancel` | 取消任务 |
 | `GET` | `/api/history/repos` | 按仓库分组的历史列表 |
 | `GET` | `/api/history/runs` | 指定仓库下的任务列表 |
 | `GET` | `/api/history/runs/{run_id}` | 任务详情与事件回放 |
 | `DELETE` | `/api/history/runs/{run_id}` | 删除历史任务 |
 
-主要 SSE 事件：`run_started`、`repo_connected`、`indexing_progress`、`routing_selected`、`retrieval_completed`、`tool_started`、`tool_completed`、`usage_updated`、`plan_event`、`verification_updated`、`answer_final`、`run_completed` / `run_failed`。
+主要 SSE 事件：`run_started`、`repo_connected`、`indexing_progress`、`routing_selected`、`retrieval_completed`、`tool_started`、`tool_completed`、`usage_updated`、`plan_event`、`verification_updated`、`answer_final`、`run_completed` / `run_failed` / `run_cancelled`、`run_status`。
+
+每条 SSE 事件带 `id: <sequence>`。客户端断线后可用最后收到的 sequence 重连（`?after=N` 或 `Last-Event-ID`），服务端先补发历史事件再衔接实时事件；任务已进入终态时会补发剩余事件、发送 `run_status` 后关闭连接。
 
 ---
 
@@ -365,7 +465,8 @@ CodeInsight-Agent/
 │   ├── indexing.py          # 索引构建共享入口
 │   └── event_mapper.py      # Tracer 事件 → SSE 事件映射
 ├── db/
-│   └── schema.sql           # 完整数据库结构（10 张表，空库初始化用）
+│   ├── schema.sql           # 完整数据库结构（12 张表，空库初始化用）
+│   └── migrations/          # 增量迁移脚本（启动时也会自动补齐字段）
 ├── docs/
 │   └── images/              # README 界面截图
 ├── web/                     # Vue 3 前端
@@ -434,6 +535,17 @@ CodeInsight-Agent/
 - **首次索引耗时**：大仓库首次全量索引需要调用 Embedding 接口，耗时与文件数量、网络状况相关；后续任务只做增量检查。
 - **代码范围**：索引只覆盖文本代码文件，二进制、超大文件与非代码数据目录会被跳过。
 - **安全**：项目不会执行被分析仓库中的任何代码；`.env` 与运行时产物均不纳入版本控制。
+
+### 断点恢复的可靠性边界
+
+- **仅 `direct` / `react` 可 checkpoint 恢复**：`plan_execute` 的分步 Agent 未接 checkpointer，崩溃后会被标记 `failed`，不会重跑。需要恢复能力的深度分析请使用 `react`。
+- **旧任务不可恢复**：升级前创建、没有 `thread_id` 的历史任务无法关联 checkpoint，恢复调度器会将其标记 `failed` 并写入原因。
+- **无 checkpoint 时的重跑条件很严格**：只有「从未产生任何执行事件」的任务才允许以首次执行方式重跑；已有事件但无 checkpoint 的任务会直接失败，避免把重新执行伪装成恢复。
+- **工具幂等不是 exactly-once**：「副作用已发生、幂等记录未写库」的窗口仍可能重放一次，需要工具自身幂等或外部去重配合；只读工具在恢复时允许重新执行。
+- **Python 线程无法被强制终止**：取消是协作式的（`CancellationProbe` 周期检查内存标记、租约归属与数据库 `cancel_requested`），卡在不可中断调用的线程只能等待其自然返回；编排器内部超时检查也不等于后台线程硬终止。
+- **租约接管存在延迟**：Worker 崩溃后，任务必须等 `RUN_LEASE_SECONDS` 过期才会被其它进程认领，启动恢复不是「立即」接管。
+- **跨进程 SSE 依赖数据库轮询**：事件补发与终态判断通过 `run_events` / `runs` 查询完成，多进程部署时实时推送只发生在持有该任务内存队列的进程，其它进程通过重连补发获得完整事件。
+- **恢复次数不设上限**：`attempt` 只做记录与观测，反复崩溃 + 反复恢复会持续累加，尚未实现「超过 N 次即放弃」的策略。
 
 ---
 

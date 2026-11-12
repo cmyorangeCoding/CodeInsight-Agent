@@ -128,6 +128,10 @@ class Orchestrator:
         self._retry_count = 0
         self._replan_count = 0
         self._failure_reason: str | None = None
+        # 取消检查回调（由执行入口注入，轮询数据库取消标记）
+        self._cancel_check: Callable[[], bool] | None = None
+        # 同一次 run 内缓存编译后的 Agent，避免 get_state / invoke 重复建图
+        self._agents: dict[str, Any] = {}
 
     # ------------------------------------------------------------------ 工具
     @staticmethod
@@ -200,6 +204,8 @@ class Orchestrator:
 
     def _stop_reason(self) -> str | None:
         """返回需要立即停止的原因，无则 None。"""
+        if self._cancelled():
+            return "任务已取消"
         if self._time_exhausted():
             return "达到最大执行时长"
         if self._tools_exhausted():
@@ -208,16 +214,41 @@ class Orchestrator:
             return "Token 预算已耗尽"
         return None
 
+    def _cancelled(self) -> bool:
+        """协作式取消检查：只在步骤/轮次边界轮询，不强杀正在执行的 LLM 调用。"""
+        if self._cancel_check is None:
+            return False
+        try:
+            return bool(self._cancel_check())
+        except Exception:  # noqa: BLE001 - 取消探测失败不应中断任务
+            return False
+
+    def _agent(self, mode: str) -> Any:
+        """创建 Agent。每次都走 factory，保持既有行为（测试会统计 factory 调用次数）。"""
+        if self.agent_factory is None:
+            raise RuntimeError("缺少 agent_factory，无法执行该策略")
+        return self.agent_factory(mode)
+
+    def _agent_state(self, mode: str, thread_id: str) -> Any:
+        """读取指定 thread 最近的 LangGraph 状态；没有 checkpointer 时返回 None。"""
+        try:
+            return self._agent(mode).get_state({"configurable": {"thread_id": thread_id}})
+        except Exception:  # noqa: BLE001 - 无 checkpoint / 无 checkpointer 都视为无状态
+            return None
+
     #统一创建 agent 并且调用，封装 agent 执行逻辑
     """
     - `mode`：direct /react/step，传给 agent 工厂，生成不同模式的 agent
     - `thread_id`：LangGraph 会话 id，保存对话上下文
     - 判断 agent_factory 为空 → 抛异常，必须注入工厂才能跑 
     """
-    def _invoke(self, mode: str, messages: list, thread_id: str) -> Any:
-        if self.agent_factory is None:
-            raise RuntimeError("缺少 agent_factory，无法执行该策略")
-        agent = self.agent_factory(mode)
+    def _invoke(self, mode: str, messages: list | None, thread_id: str) -> Any:
+        """调用 Agent。
+
+        ``messages=None`` 表示「续跑已有 checkpoint」：LangGraph 会用同一 thread 的
+        最新 checkpoint 继续执行未完成的 super-step，而不是开一轮新对话。
+        """
+        agent = self._agent(mode)
         config = {
             "configurable": {"thread_id": thread_id},
             "callbacks": [self.collector, *self.callbacks],
@@ -235,6 +266,8 @@ class Orchestrator:
         # 未知模式也兜底：用 react 的限制
         else:
             config["recursion_limit"] = self.limits.react_max_tool_calls * 4 + 10
+        if messages is None:
+            return agent.invoke(None, config=config)
         return agent.invoke({"messages": messages}, config=config)
 
     # ------------------------------------------------------------------ 主入口
@@ -245,8 +278,11 @@ class Orchestrator:
         question_id: str | None = None,
         force_strategy: Strategy | None = None, #强制指定策略，绕过路由判断（调试用）
         thread_id: str | None = None,
+        resume_mode: str | None = None,   # 非空 = 从该模式的 LangGraph checkpoint 续跑
+        initial_messages: list | None = None,  # 会话历史（conversation_thread）种子
+        cancel_check: Callable[[], bool] | None = None,
     ) -> OrchestrationResult:
-        """执行一次完整编排。"""
+        """执行一次完整编排，或从已有 checkpoint 续跑。"""
         from app.orchestration.complexity import ComplexityRouter
 
         self._start = time.perf_counter()
@@ -254,6 +290,8 @@ class Orchestrator:
         self._retry_count = 0
         self._replan_count = 0
         self._failure_reason = None
+        self._cancel_check = cancel_check
+        self._agents = {}
         self.collector = EvidenceCollector() #新建证据收集器实例，清空上一轮证据
         # 偏好按「轮」失效：同一轮内规划/汇总共用一次读取结果
         self._preferences_cache = None
@@ -263,6 +301,13 @@ class Orchestrator:
         router = ComplexityRouter(llm=self.routing_llm, tracer=self.tracer)
         route = router.route(question, force=force_strategy)
         self._log("orchestration_start", run_id=self._run_id, strategy=str(route.strategy))
+        if resume_mode:
+            # 防呆：恢复模式与实际路由不一致时立即失败，绝不在旧 checkpoint 上开新一轮
+            if str(route.strategy) != resume_mode:
+                raise RuntimeError(
+                    f"恢复模式冲突：route={route.strategy} resume={resume_mode}"
+                )
+            self._log("orchestration_resume", mode=resume_mode, thread_id=thread_id)
 
         #初始化变量
         answer = ""
@@ -272,9 +317,15 @@ class Orchestrator:
 
         try:
             if route.strategy == Strategy.DIRECT:
-                answer = self._run_single(question, mode="direct", thread_id=thread_id)
+                answer = self._run_single(
+                    question, mode="direct", thread_id=thread_id,
+                    resume=resume_mode == "direct", initial_messages=initial_messages,
+                )
             elif route.strategy == Strategy.REACT:
-                answer = self._run_single(question, mode="react", thread_id=thread_id)
+                answer = self._run_single(
+                    question, mode="react", thread_id=thread_id,
+                    resume=resume_mode == "react", initial_messages=initial_messages,
+                )
             else:
                 plan, answer, verification = self._run_plan(question, thread_id)
                 #如果校验不通过
@@ -291,6 +342,11 @@ class Orchestrator:
             self._log("orchestration_error", error=f"{type(exc).__name__}: {exc}")
             answer = answer or f"（执行失败：{type(exc).__name__}: {exc}）"
             status = "failed"
+
+        # 取消是协作式的：正在执行的 LLM 调用无法强杀，但结果不再标记为成功
+        if self._cancelled() and status == "success":
+            self._failure_reason = "cancelled"
+            status = "partial" if answer else "failed"
 
         # 不允许在尚有必要步骤未完成时宣告成功：计划状态非 COMPLETED 一律降级
         #只要：存在失败原因 或者 计划存在并且计划整体状态不是 COMPLETED，就降级状态：有答案→partial，无答案→failed
@@ -325,8 +381,36 @@ class Orchestrator:
         )
 
     # ------------------------------------------------------------------ 单步策略
-    def _run_single(self, question: str, mode: str, thread_id: str) -> str:
-        result = self._invoke(mode, [{"role": "user", "content": question}], thread_id)
+    def _run_single(self, question: str, mode: str, thread_id: str,
+                    resume: bool = False,
+                    initial_messages: list | None = None) -> str:
+        """Direct / ReAct：首次执行传问题；恢复时优先续跑 checkpoint。
+
+        三种情况必须区分（已用 langgraph 1.2.12 实测验证）：
+        1. 有 checkpoint 且 `state.next` 非空 → 崩溃残留，`invoke(None)` 从断点续跑；
+        2. 有 checkpoint 但 `next` 为空 → 图在崩溃前已经跑完，直接取最终状态，不重跑；
+        3. 无 checkpoint → 才是真正的首次执行。
+        """
+        if resume:
+            state = self._agent_state(mode, thread_id)
+            if state is None:
+                # 指定恢复但找不到 checkpoint：交回调用方决定失败，不偷偷重跑
+                raise RuntimeError(f"恢复失败：线程 {thread_id} 不存在可恢复 checkpoint")
+            if state.next:
+                self._log("checkpoint_resume", mode=mode, thread_id=thread_id,
+                          next=list(state.next))
+                result = self._invoke(mode, None, thread_id)
+                return last_ai_content(result)
+            # 图已完成：checkpoint 里的最终消息就是答案，不开启新一轮
+            self._log("checkpoint_already_finished", mode=mode, thread_id=thread_id)
+            values = getattr(state, "values", {}) or {}
+            return last_ai_content({"messages": values.get("messages", [])})
+
+        if self._cancelled():
+            return "（任务已取消，未开始执行）"
+        messages = list(initial_messages or [])
+        messages.append({"role": "user", "content": question})
+        result = self._invoke(mode, messages, thread_id)
         return last_ai_content(result)
 
     # ------------------------------------------------------------------ 计划策略
@@ -357,6 +441,9 @@ class Orchestrator:
             if stop:
                 self._failure_reason = FailureType.BUDGET_EXHAUSTED.value
                 self._log("plan_stopped", reason=stop)
+                # 取消后不再做校验/重规划，直接带着已有部分结果收尾
+                if self._cancelled():
+                    break
 
             #如果没注入校验器 Verifier，不做校验，直接退出循环
             if self.verifier is None:

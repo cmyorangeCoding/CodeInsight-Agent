@@ -21,24 +21,19 @@
 from __future__ import annotations
 
 import asyncio
-import json
 import os
+import queue as queue_module
 import sys
-import traceback
-from concurrent.futures import TimeoutError as FuturesTimeoutError
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from sse_starlette.sse import EventSourceResponse
 
-from app.api.events import RunEvent, RunState
-from app.api.task_manager import RunManager, run_manager
+from app.api.task_manager import run_manager, execution_thread_id
 from app.config import settings
-from app.event_mapper import map_tracer_to_run_event
 
 
 # --------------------------------------------------------------------------- Request / Response
@@ -116,6 +111,13 @@ def _on_startup():
         # 数据库连不上不能让整个应用挂掉（本地开发没 Postgres 时降级）
         print(f"[startup] WARNING: DB init failed (running without persistence): {exc}")
 
+    # 启动恢复调度器：扫描租约过期的未完成任务，按 checkpoint 续跑
+    try:
+        from app.api.recovery import recovery_scheduler
+        recovery_scheduler.start()
+    except Exception as exc:  # noqa: BLE001
+        print(f"[startup] WARNING: recovery scheduler failed to start: {exc}")
+
 
 # ----------------------------- 注册子 Router -----------------------------
 # history.py 里的 /api/history/* 路由挂到主 app 上，职责分离
@@ -138,62 +140,7 @@ def _parse_github_url(url: str) -> tuple[str, str]:
     raise ValueError(f"无法解析 GitHub 仓库地址: {url}")
 
 
-def _serialize_tracer_events(tracer) -> str:
-    """
-    把 tracer.events 列表序列化成 JSON 字符串，存进 runs.events_json 列。
-
-    关键：**用 `_map_tracer_to_run_event` 做映射**，跟实时 SSE 推送走同一条链路。
-    这样历史查看拿到的 events 和实时看到的 events 格式完全一致，
-    前端模板不用关心是实时流还是历史回放。
-
-    为什么要截断？
-      tracer.events 里可能有 read_file 的完整文件内容（几 KB 甚至几十 KB），
-      直接存的话 runs 表会膨胀很快。所以每个事件的 data 字段超过 2KB 就截断。
-    """
-    import json as _json
-
-    MAX_DATA_SIZE = 2048  # 每个事件 data 的最大字符数
-
-    truncated = []
-    for ev in tracer.events:
-        event_type = ev.get("type", "")
-        # 用映射函数把 Tracer raw type → RunEvent type
-        mapped = map_tracer_to_run_event(event_type, ev)
-        if mapped is None:
-            continue  # span_* 等内部观测标签不存
-        run_event_type, mapped_data = mapped
-
-        # 截断大 payload
-        data_copy = {}
-        for k, v in mapped_data.items():
-            s = _json.dumps(v, ensure_ascii=False) if not isinstance(v, str) else v
-            if len(s) > MAX_DATA_SIZE:
-                data_copy[k] = s[:MAX_DATA_SIZE] + f"...(truncated {len(s)} chars)"
-            else:
-                data_copy[k] = v
-
-        truncated.append({
-            "type": run_event_type,
-            "data": data_copy,
-        })
-
-    return _json.dumps(truncated, ensure_ascii=False) if truncated else "[]"
-
-
-# --------------------------------------------------------------------------- Tracer 实时事件 → RunEvent 映射
-
-
-
-def _live_emit_tracer_event(bridge, event_type: str, tracer_data: dict) -> None:
-    """Tracer.on_event 回调实现：实时把 tracer 事件推送到 SSE 队列。
-
-    这就是"实时流式"的关键 —— 原来 orchestrator.run() 全部返回后才回放，
-    现在每一次 tracer.add_event 都实时走这里 → bridge.emit → SSE 队列 → 前端立即收到。
-    """
-    mapped = map_tracer_to_run_event(event_type, tracer_data)
-    if mapped is not None:
-        run_event_type, run_data = mapped
-        bridge.emit(run_event_type, run_data)
+# 事件快照 / 实时映射逻辑已迁移到 app.api.publisher（先持久化再推送）
 
 
 #根据入参 `repo_source` 选择仓库实现
@@ -217,231 +164,7 @@ def _build_provider(req: CreateRunRequest):
     return LocalRepositoryProvider(path, repository_id=rid)
 
 
-def _run_orchestrator_sync(run_id: str, question: str, provider, strategy: str,
-                           thread_id: str, user_id: str, bridge) -> None:
-    """
-    在后台线程里同步跑编排层。
-
-    这是所有真实业务的核心 —— 保持同步不改成 async，
-    只在外层用 ThreadPoolExecutor 包装，避免重写 Orchestrator。
-    """
-    try:
-        from app.models.llm import get_llm, get_summarization_llm
-        from app.memory.postgres_resources import open_memory_resources
-        from app.rag.code_vector_store import create_session_factory, CodeVectorStore
-        from app.rag.retriever import CodeRetriever
-        from app.agents.repository_agent import build_repository_tools, create_repository_agent_factory
-        from app.observability.callback import TraceCallback
-        from app.observability.token_budget import TokenBudget
-        from app.observability.tracer import Tracer
-        from app.orchestration.executor import Orchestrator
-        from app.orchestration.limits import OrchestrationLimits
-        from app.orchestration.models import Strategy
-        from app.orchestration.verifier import AnalyzerRepoAccess, ProviderRepoAccess, Verifier
-        from app.indexing import ensure_index
-
-        # 先查任务状态：任务已经被取消，直接退出，不继续执行
-        state = run_manager.get_state(run_id)
-        if state is None or state.status == "cancelled":
-            return
-
-        # 推送两个初始化事件给前端
-        bridge.emit("run_started", {
-            "question": question[:200],
-            "repo_source": state.repo_source,
-            "repo_identifier": state.repo_identifier,
-        })
-        bridge.emit("repo_connected", provider.repo_info)
-
-
-        # 策略映射：把前端字符串参数转成内部枚举Strategy
-        _FORCE_MAP = {
-            "direct": Strategy.DIRECT,
-            "react": Strategy.REACT,
-            "plan": Strategy.PLAN_EXECUTE,
-            "plan_execute": Strategy.PLAN_EXECUTE,
-        }
-        #`forced=None` 代表 `auto`，交给编排器内部自动选路由策略
-        forced = _FORCE_MAP.get(strategy) if strategy and strategy != "auto" else None
-
-        # 内存/向量库资源上下文管理器，退出时自动释放资源
-        with open_memory_resources() as (checkpointer, store, embeddings):
-            SessionFactory = create_session_factory()
-            session = SessionFactory()
-
-            # GitHub特殊逻辑：Github API有请求限额，不走API拉文件，优先git浅克隆到本地
-            if getattr(provider, "source", "local") == "github" and getattr(provider, "_clone_path", None) is None:
-                try:
-                    bridge.emit("indexing_completed", {"note": "cloning repository for deep analysis..."})
-                    # 注意：这是同步线程里调用async函数，用asyncio.run开一个独立事件循环
-                    # 克隆仓库到本地
-                    asyncio.run(provider.prepare_deep_analysis())
-                except Exception as e:
-                    # 克隆失败则回退为 MCP 按需读取（不索引、无 RAG）
-                    bridge.emit("indexing_completed", {"note": f"clone failed, fallback to on-demand MCP: {e}"})
-
-            # 确保索引（每次都跑增量检查，按文件 hash 判断变更）
-            try:
-                def _index_progress(seq, total, file_path, indexed, skipped):
-                    bridge.emit("indexing_progress", {
-                        "seq": seq, "total": total, "file": file_path,
-                        "indexed": indexed, "skipped": skipped,
-                    })
-
-                ensure_index(session, embeddings, provider, force=False, progress_callback=_index_progress)
-                bridge.emit("indexing_completed", {"note": "索引同步完成（增量检查）"})
-            except Exception as e:
-                # 索引失败不致命 —— 远程按需模式下没有本地路径
-                bridge.emit("indexing_completed", {"note": f"index skipped: {e}"})
-
-            ## 初始化观测、限流、检索组件
-            # 关键：on_event= 把 Tracer 接到 SSE 队列 —— 工具 start/end、RAG 检索、LLM 用量
-            # 全部实时推送，不再等 orchestrator.run() 返回后回放。
-            tracer = Tracer(on_event=lambda et, data: _live_emit_tracer_event(bridge, et, data))
-            budget = TokenBudget(
-                max_total_tokens=500000, max_input_tokens=60000, reserved_output_tokens=2000,
-            )
-            retriever = CodeRetriever(
-                session=session, embeddings=embeddings,
-                repository_id=provider.repository_id, tracer=tracer,
-            )
-            # 构造Agent可用工具集 + 记忆对象
-            tools, memory = build_repository_tools(
-                provider=provider, token_budget=budget, store=store,
-                repository_id=provider.repository_id,
-                retriever=retriever, user_id=user_id or "default-user",
-                tracer=tracer,
-            )
-
-            ## 统一仓库访问抽象，给Verifier验证模块使用
-            analyzer = getattr(provider, "_analyzer", None)
-            repo_access = (
-                AnalyzerRepoAccess(analyzer) if analyzer is not None
-                else ProviderRepoAccess(provider)
-            )
-            verifier = Verifier(
-                repo=repo_access,
-                llm=get_llm(), limits=OrchestrationLimits(), tracer=tracer,
-            )
-            llm = get_llm()
-
-            # 实例化编排核心 Orchestrator
-            orchestrator = Orchestrator(
-                llm=llm, routing_llm=get_summarization_llm(),
-                agent_factory=create_repository_agent_factory(
-                    llm, tools, budget, tracer, memory, checkpointer,
-                ),
-                budget=budget, tracer=tracer,
-                limits=OrchestrationLimits(),
-                verifier=verifier,
-                callbacks=[TraceCallback(tracer=tracer, token_budget=budget)],
-                memory=memory,
-            )
-
-            # --- 执行 Orchestrator.run() ---
-            bridge.emit("routing_selected", {"strategy": strategy})
-            state = run_manager.get_state(run_id)
-            if state:
-                state.status = "running"
-                state.start_time = time.time()
-
-            ## 执行前再检查一次取消标记
-            if bridge.cancelled():
-                bridge.emit("run_cancelled", {"reason": "before_run"})
-                if state:
-                    state.status = "cancelled"
-                    state.end_time = time.time()
-                return
-
-            ## 【核心阻塞调用】运行Agent编排逻辑
-            # tracer.on_event 回调已经在上面注入 → 工具/检索/LLM 事件实时推送到 SSE 队列，
-            # orchestrator.run() 返回后只需要推送最终结果（验证结论、答案、汇总指标）
-            #
-            # thread_id 决定短期记忆（LangGraph checkpointer 对话续接）：
-            #   - 前端传了就用前端的（支持跨 run 续接同一仓库的多轮对话）
-            #   - 没传 → 按仓库标识自动生成稳定 thread_id，保证同一仓库多次提问自动续接上下文
-            stable_thread_id = thread_id or f"repo-{provider.repository_id}"
-            result = orchestrator.run(question, force_strategy=forced, thread_id=stable_thread_id)
-
-            # 推送验证模块结果（编排层主动推送，不走 Tracer）
-            if result.verification is not None:
-                bridge.emit("verification_updated", {
-                    "passed": result.verification.passed,
-                    "issues": result.verification.issues[:5],
-                    "missing_evidence": result.verification.missing_evidence[:5],
-                })
-
-            # 推送最终回答
-            bridge.emit("answer_final", {"answer": result.answer})
-
-            # 推送任务完成汇总指标
-            record = result.record
-            bridge.emit("run_completed", {
-                "status": record.status,
-                "duration_ms": record.duration_ms,
-                "tool_call_count": record.tool_call_count,
-                "input_tokens": record.input_tokens,
-                "output_tokens": record.output_tokens,
-                "failure_reason": record.failure_reason,
-            })
-
-            # 更新 RunState（status 归一到 RunStatus 协议的五个值）
-            state = run_manager.get_state(run_id)
-            final_status = (
-                "completed" if record.status in ("success", "partial") else "failed"
-            )
-            if state:
-                state.status = final_status
-                state.answer = result.answer
-                state.strategy = str(result.strategy)
-                state.end_time = time.time()
-
-            # 写入 runs 表（成功结束 → update answer/status/duration/events_json）
-            try:
-                from app.db import SessionLocal as _DBSession
-                from app.db.runs import RunDAO as _RunDAO
-                with _DBSession() as _s:
-                    _RunDAO(_s).update_status(
-                        run_id=run_id,
-                        status=final_status,
-                        answer=result.answer,
-                        strategy=str(result.strategy),
-                        duration_ms=record.duration_ms,
-                        events_json=_serialize_tracer_events(tracer),
-                    )
-            except Exception as _dbe:
-                print(f"[_run] WARNING: DB update_status (success) failed: {_dbe}")
-
-            session.close()
-
-    except Exception as exc:
-        # 全局兜底异常捕获：任何异常都不会让线程直接崩掉
-        error_detail = f"{type(exc).__name__}: {exc}"
-        bridge.emit("run_failed", {"error": error_detail})
-        state = run_manager.get_state(run_id)
-        if state:
-            state.status = "failed"
-            state.error = error_detail
-            state.end_time = time.time()
-        # 写入 runs 表（失败结束 → update status=failed + 已有事件快照）
-        try:
-            from app.db import SessionLocal as _DBSession2
-            from app.db.runs import RunDAO as _RunDAO2
-            with _DBSession2() as _s2:
-                _RunDAO2(_s2).update_status(
-                    run_id=run_id,
-                    status="failed",
-                    answer=error_detail,
-                    duration_ms=0.0,
-                    events_json=_serialize_tracer_events(tracer),
-                )
-        except Exception as _dbe2:
-            print(f"[_run] WARNING: DB update_status (failed) failed: {_dbe2}")
-        # 不 raise —— 后台线程需要优雅退出
-        traceback.print_exc()
-
-
-import time  # noqa: E402 —— 需要在函数内部用到
+# 任务执行逻辑已迁移到 app.api.run_executor（统一首次执行 / checkpoint 恢复）
 
 
 # --------------------------------------------------------------------------- Routes
@@ -536,26 +259,33 @@ async def create_run(req: CreateRunRequest):
     结果通过 SSE（/events）或轮询（GET /runs/{id}）获取 —— 前后端职责分离。
     """
     provider = _build_provider(req)
+    repo_identifier = req.github_url or req.repo_path or settings.repo.default_local_path or ""
 
     state = run_manager.create_run(
         question=req.question,
         repo_source=req.repo_source,
-        repo_identifier=req.github_url or req.repo_path or settings.repo.default_local_path,
+        repo_identifier=repo_identifier,
         repository_id=provider.repository_id,
+        strategy=req.strategy,
     )
+    state.thread_id = execution_thread_id(state.run_id)
 
     # 写入 runs 表（DB 连不上不影响主流程，降级为内存状态）
+    # thread_id / requested_* 落库是断点恢复的前提：恢复调度器只认数据库里的关联
     try:
         from app.db import SessionLocal
         from app.db.runs import RunDAO
-        _repo_id = req.github_url or req.repo_path or settings.repo.default_local_path or ""
         with SessionLocal() as _s:
             RunDAO(_s).create(
                 run_id=state.run_id,
                 repo_source=req.repo_source,
-                repo_identifier=_repo_id,
+                repo_identifier=repo_identifier,
                 question=req.question,
                 repository_id=provider.repository_id,
+                thread_id=state.thread_id,
+                requested_strategy=req.strategy,
+                requested_thread_id=req.thread_id,
+                user_id=req.user_id,
             )
     except Exception as _dbe:
         print(f"[create_run] WARNING: DB insert failed: {_dbe}")
@@ -564,13 +294,12 @@ async def create_run(req: CreateRunRequest):
     if bridge is None:
         raise HTTPException(500, "任务初始化失败")
 
-    # 提交任务进线程池，立刻返回run_id，不等分析结束
-    future = run_manager._executor.submit(
-        _run_orchestrator_sync,
-        state.run_id, req.question, provider, req.strategy,
-        req.thread_id, req.user_id, bridge,
-    )
-    run_manager._futures[state.run_id] = future
+    # 统一执行入口：首次执行与恢复共用 execute_run。
+    # 认领（pending → running）在 execute_run 内部用条件 UPDATE 原子完成。
+    from app.api.run_executor import execute_run
+
+    run_manager.submit(state.run_id, execute_run, state.run_id,
+                       resume=False, provider=provider)
 
     return CreateRunResponse(
         run_id=state.run_id,
@@ -579,73 +308,135 @@ async def create_run(req: CreateRunRequest):
     )
 
 
+TERMINAL_STATUSES = ("completed", "failed", "cancelled", "success", "partial")
+
+
+def _load_run_from_db(run_id: str):
+    """同步查库（在线程池里调用，避免阻塞事件循环）。"""
+    try:
+        from app.db import SessionLocal
+        from app.db.runs import RunDAO
+
+        with SessionLocal() as session:
+            return RunDAO(session).get(run_id)
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _db_status(run_id: str) -> str | None:
+    record = _load_run_from_db(run_id)
+    return record.status if record is not None else None
+
+
 @app.get("/api/runs/{run_id}", response_model=RunStatusResponse)
 async def get_run(run_id: str):
-    """查询任务状态。"""
+    """查询任务状态。内存没有时回落到数据库（服务重启后的任务仍可查询）。"""
     state = run_manager.get_state(run_id)
-    if state is None:
+    if state is not None:
+        return RunStatusResponse(
+            run_id=state.run_id,
+            status=state.status,
+            question=state.question[:200],
+            repo_source=state.repo_source,
+            repo_identifier=state.repo_identifier,
+            repository_id=state.repository_id,
+            strategy=state.strategy,
+            answer=state.answer,
+            error=state.error,
+            elapsed_ms=state.elapsed_ms(),
+        )
+
+    record = await asyncio.to_thread(_load_run_from_db, run_id)
+    if record is None:
         raise HTTPException(404, f"run {run_id} not found")
+    elapsed_ms = None
+    if record.duration_ms is not None:
+        elapsed_ms = record.duration_ms
+    elif record.created_at is not None:
+        end = record.updated_at or datetime.now(timezone.utc).replace(tzinfo=None)
+        elapsed_ms = max(0.0, (end - record.created_at).total_seconds() * 1000)
     return RunStatusResponse(
-        run_id=state.run_id,
-        status=state.status,
-        question=state.question[:200],
-        repo_source=state.repo_source,
-        repo_identifier=state.repo_identifier,
-        repository_id=state.repository_id,
-        strategy=state.strategy,
-        answer=state.answer,
-        error=state.error,
-        elapsed_ms=state.elapsed_ms(),
+        run_id=record.run_id,
+        status=record.status,
+        question=(record.question or "")[:200],
+        repo_source=record.repo_source,
+        repo_identifier=record.repo_identifier or "",
+        repository_id=record.repository_id or "",
+        strategy=record.strategy,
+        answer=record.answer or "",
+        error=record.last_error,
+        elapsed_ms=elapsed_ms,
     )
 
 
 @app.post("/api/runs/{run_id}/cancel")
 async def cancel_run(run_id: str):
-    """请求取消任务。"""
+    """请求取消任务。终态任务不会被改写（数据库条件更新兜底）。"""
     ok = run_manager.cancel_run(run_id)
     if not ok:
-        raise HTTPException(404, f"run {run_id} not found")
+        raise HTTPException(404, f"run {run_id} not found or already finished")
     return {"run_id": run_id, "cancelled": True}
 
 
 @app.get("/api/runs/{run_id}/events")
-async def run_events(run_id: str):
-    """SSE 事件流 —— 订阅该任务的所有执行事件。
+async def run_events(run_id: str, request: Request,
+                     after: int | None = None,
+                     last_sequence: int | None = None):
+    """SSE 事件流，支持断线续传。
+
+    续传游标优先级：``?after=`` > ``?last_sequence=`` > ``Last-Event-ID`` 头 > -1。
+    服务端先补发 run_events 中 sequence > cursor 的历史事件，再衔接实时队列；
+    两边都按 sequence 去重，避免补发与实时交叉导致重复/遗漏。
     """
+    from app.api.publisher import RunEventPublisher
+
     state = run_manager.get_state(run_id)
-    if state is None:
-        raise HTTPException(404, f"run {run_id} not found")
+    publisher = run_manager.publisher(run_id)
+    if state is None and publisher is None:
+        record = await asyncio.to_thread(_load_run_from_db, run_id)
+        if record is None:
+            raise HTTPException(404, f"run {run_id} not found")
 
-    q = run_manager.queue(run_id)
-
-    async def event_generator():
-        # 握手事件，告诉前端连接成功
-        yield {"event": "connected", "data": json.dumps({"run_id": run_id}, ensure_ascii=False)}
-
-        while True:
-            # 用非阻塞轮询 + asyncio.sleep 避免阻塞事件循环
-            try:
-                #队列有数据：取出事件，转成 SSE 协议字典抛出；
-                evt = q.get_nowait()
-                # 必须用 dict 形式（event/data/id），直接 yield 字符串会被 sse-starlette 二次包装
-                yield evt.to_sse_dict()
-            except Exception:
-                # 判断任务是否已经结束、队列排空；满足就跳出循环，关闭长连接；
-                s = run_manager.get_state(run_id)
-                if s and s.status in ("completed", "failed", "cancelled", "success", "partial") and q.empty():
-                    break
-                await asyncio.sleep(0.1)
-
-        # 完成后保留 60 秒再清理，允许断线重连
+    cursor = after if after is not None else last_sequence
+    if cursor is None:
+        header = request.headers.get("last-event-id")
         try:
-            await asyncio.sleep(60)
-        except Exception:
-            pass
-        run_manager.cleanup(run_id)
+            cursor = int(header) if header else -1
+        except (TypeError, ValueError):
+            cursor = -1
+    replayer = publisher or RunEventPublisher(run_id)
+
+    async def _replay(after: int):
+        return await asyncio.to_thread(replayer.replay, after)
+
+    def _drain():
+        q = run_manager.queue(run_id)
+        if q is None:
+            return []
+        out = []
+        while True:
+            try:
+                out.append(q.get_nowait())
+            except queue_module.Empty:
+                return out
+
+    async def _status():
+        s = run_manager.get_state(run_id)
+        if s is not None and s.status in TERMINAL_STATUSES:
+            return s.status
+        # 内存里是 running/recovering 时也查一次库：可能被其他进程取消或已由新 Worker 结束
+        db_status = await asyncio.to_thread(_db_status, run_id)
+        if db_status:
+            return db_status
+        return s.status if s is not None else None
+
+    from app.api.sse import stream_events
 
     return EventSourceResponse(
-        event_generator(),
+        stream_events(run_id, cursor, _replay, _drain, _status,
+                      is_disconnected=request.is_disconnected),
         media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
 
 

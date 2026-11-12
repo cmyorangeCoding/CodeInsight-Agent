@@ -2,13 +2,31 @@
 """
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
-from sqlalchemy import Column, String, Text, Double, DateTime, Index, desc
+from sqlalchemy import (
+    Boolean,
+    Column,
+    DateTime,
+    Double,
+    Index,
+    Integer,
+    String,
+    Text,
+    and_,
+    desc,
+    or_,
+    update,
+)
 from sqlalchemy.orm import Session
 
 from app.db import Base
+
+
+def utcnow() -> datetime:
+    """统一使用 naive UTC，和现有 created_at/updated_at 的存储方式一致。"""
+    return datetime.now(timezone.utc).replace(tzinfo=None)
 
 
 # ------------------------------- ORM 实体 -------------------------------
@@ -56,16 +74,35 @@ class Run(Base):
     #   运行时前端靠 SSE 实时推送 events；历史查看时从 DB 读这列反序列化，
     #   执行进度 + 代码证据（retrieval_completed 事件里带 chunks）自动恢复，
     #   前端复用现有模板渲染。
-    # 为什么不新建 run_events 表？
-    #   一条 run 几百个事件 → 几百行数据，写起来麻烦查起来也麻烦。
-    #   Tracer 本来就有 self.events 列表，直接 json.dumps() 最省事。
+    # 为什么还新增了 run_events 表？
+    #   events_json 只在任务结束时写一次，服务崩溃时整段事件会丢失；
+    #   run_events 逐条持久化，用于崩溃后的事件补发与 SSE 续传，
+    #   events_json 继续保留作为历史回放的兼容快照。
     events_json = Column(Text, nullable=True, comment="执行事件流 JSON 快照")
+
+    # ---------------- 断点恢复相关（2026-11 增量） ----------------
+    thread_id = Column(String(64), nullable=True,
+                       comment="LangGraph 执行线程 ID（execution_thread_id）")
+    requested_thread_id = Column(String(128), nullable=True,
+                                 comment="调用方传入的会话线程 ID（conversation_thread_id）")
+    requested_strategy = Column(String(32), nullable=True,
+                                comment="创建任务时请求的策略（auto/direct/react/plan）")
+    user_id = Column(String(64), nullable=True, comment="用户标识（长期记忆隔离用）")
+    attempt = Column(Integer, nullable=False, default=0, server_default="0",
+                     comment="执行/恢复次数")
+    worker_id = Column(String(64), nullable=True, comment="当前执行者标识")
+    lease_until = Column(DateTime, nullable=True, comment="执行租约到期时间（UTC）")
+    cancel_requested = Column(Boolean, nullable=False, default=False,
+                              server_default="false", comment="是否已被请求取消")
+    last_error = Column(Text, nullable=True, comment="最近一次异常信息")
 
     __table_args__ = (
         # 按仓库查历史 + 按时间倒序（最常用的查询模式）
         Index("idx_runs_repo_time", "repo_source", "repo_identifier", "created_at"),
         # 全局时间倒序
         Index("idx_runs_created", "created_at"),
+        # 恢复调度器：按状态 + 租约筛选未完成任务
+        Index("idx_runs_status_lease", "status", "lease_until"),
     )
 
     def __repr__(self):
@@ -87,7 +124,11 @@ class RunDAO:
 
     # ---------- C ----------
     def create(self, run_id: str, repo_source: str, repo_identifier: str,
-               question: str, repository_id: str | None = None) -> Run:
+               question: str, repository_id: str | None = None,
+               thread_id: str | None = None,
+               requested_strategy: str | None = None,
+               requested_thread_id: str | None = None,
+               user_id: str | None = None) -> Run:
         """新建一条 run 记录（任务刚创建时调用，status=pending）。"""
         run = Run(
             run_id=run_id,
@@ -96,11 +137,185 @@ class RunDAO:
             repository_id=repository_id,
             question=question,
             status="pending",
+            thread_id=thread_id,
+            requested_strategy=requested_strategy,
+            requested_thread_id=requested_thread_id,
+            user_id=user_id,
+            attempt=0,
         )
         self.db.add(run)
         self.db.commit()
         self.db.refresh(run)
         return run
+
+    # ---------- 任务认领 / 租约 / 终态保护 ----------
+    # 全部用「条件 UPDATE + rowcount」实现，不依赖 Python 锁：
+    # 多进程、多 Worker 下只有一个 UPDATE 能命中，天然原子。
+
+    def claim(self, run_id: str, worker_id: str, lease_seconds: float = 60.0,
+              target_status: str = "running", now: datetime | None = None) -> bool:
+        """原子认领一个 Run。
+
+        可认领条件（终态 completed/failed/cancelled 永远不满足）：
+          - pending / recovering：只要没有有效租约
+          - running：只有租约已过期或从未设置（原 Worker 可能已崩溃）
+
+        返回 True 表示本 Worker 拿到执行权。
+        """
+        now = now or utcnow()
+        lease_until = now + timedelta(seconds=lease_seconds)
+        claimable = or_(
+            and_(
+                Run.status.in_(("pending", "recovering")),
+                or_(Run.lease_until.is_(None), Run.lease_until < now),
+            ),
+            and_(
+                Run.status == "running",
+                or_(Run.lease_until.is_(None), Run.lease_until < now),
+            ),
+        )
+        result = self.db.execute(
+            update(Run)
+            .where(Run.run_id == run_id, claimable)
+            .values(
+                status=target_status,
+                worker_id=worker_id,
+                lease_until=lease_until,
+                attempt=Run.attempt + 1,
+                last_error=None,
+                updated_at=now,
+            )
+        )
+        self.db.commit()
+        return result.rowcount == 1
+
+    def mark_running(self, run_id: str, worker_id: str,
+                     lease_seconds: float = 60.0) -> bool:
+        """recovering → running；只允许当前 Worker 操作。"""
+        now = utcnow()
+        result = self.db.execute(
+            update(Run)
+            .where(
+                Run.run_id == run_id,
+                Run.worker_id == worker_id,
+                Run.status.in_(("recovering", "running")),
+            )
+            .values(
+                status="running",
+                lease_until=now + timedelta(seconds=lease_seconds),
+                updated_at=now,
+            )
+        )
+        self.db.commit()
+        return result.rowcount == 1
+
+    def renew_lease(self, run_id: str, worker_id: str,
+                    lease_seconds: float = 60.0) -> bool:
+        """续租。返回 False 说明执行权已丢失（被别的 Worker 接管或已终态）。"""
+        now = utcnow()
+        result = self.db.execute(
+            update(Run)
+            .where(
+                Run.run_id == run_id,
+                Run.worker_id == worker_id,
+                Run.status.in_(("running", "recovering")),
+            )
+            .values(lease_until=now + timedelta(seconds=lease_seconds), updated_at=now)
+        )
+        self.db.commit()
+        return result.rowcount == 1
+
+    def finish(self, run_id: str, worker_id: str, status: str,
+               answer: str | None = None,
+               strategy: str | None = None,
+               duration_ms: float | None = None,
+               events_json: str | None = None,
+               last_error: str | None = None) -> bool:
+        """终态写入（只允许 running/recovering → 终态）。
+
+        校验 worker_id，防止旧 Worker / 延迟执行覆盖新 Worker 的结果；
+        条件里排除终态，保证「取消与完成竞争」时只有一个生效。
+        """
+        values: dict = {"status": status, "updated_at": utcnow()}
+        if answer is not None:
+            values["answer"] = answer
+        if strategy is not None:
+            values["strategy"] = strategy
+        if duration_ms is not None:
+            values["duration_ms"] = duration_ms
+        if events_json is not None:
+            values["events_json"] = events_json
+        if last_error is not None:
+            values["last_error"] = last_error
+        result = self.db.execute(
+            update(Run)
+            .where(
+                Run.run_id == run_id,
+                Run.worker_id == worker_id,
+                Run.status.in_(("running", "recovering")),
+            )
+            .values(**values)
+        )
+        self.db.commit()
+        return result.rowcount == 1
+
+    def fail_unrecoverable(self, run_id: str, worker_id: str, reason: str) -> bool:
+        """无法安全恢复：标记 failed 并记录原因（绝不伪装成恢复成功）。"""
+        return self.finish(run_id, worker_id, "failed", last_error=reason,
+                           answer=f"（任务无法安全恢复：{reason}）")
+
+    def request_cancel(self, run_id: str) -> bool:
+        """取消请求：只对非终态任务生效，终态永远不会被改写。"""
+        now = utcnow()
+        result = self.db.execute(
+            update(Run)
+            .where(
+                Run.run_id == run_id,
+                Run.status.in_(("pending", "running", "recovering")),
+            )
+            .values(status="cancelled", cancel_requested=True, updated_at=now)
+        )
+        self.db.commit()
+        return result.rowcount == 1
+
+    def is_cancel_requested(self, run_id: str) -> bool:
+        row = self.db.query(Run.cancel_requested, Run.status).filter(
+            Run.run_id == run_id
+        ).first()
+        if row is None:
+            return False
+        return bool(row[0]) or row[1] == "cancelled"
+
+    def update_strategy(self, run_id: str, strategy: str) -> None:
+        """路由决策确定后立即落库：恢复时需要知道该用哪个 Agent 图续跑。"""
+        self.db.execute(
+            update(Run)
+            .where(Run.run_id == run_id)
+            .values(strategy=strategy, updated_at=utcnow())
+        )
+        self.db.commit()
+
+    def list_stale(self, now: datetime | None = None, limit: int = 20) -> list[Run]:
+        """列出可能由崩溃 Worker 留下的未完成任务（租约为空或已过期）。"""
+        now = now or utcnow()
+        return (
+            self.db.query(Run)
+            .filter(
+                Run.status.in_(("pending", "running", "recovering")),
+                or_(Run.lease_until.is_(None), Run.lease_until < now),
+            )
+            .order_by(Run.created_at.asc())
+            .limit(limit)
+            .all()
+        )
+
+    def count_events(self, run_id: str) -> int:
+        from app.db.run_events import RunEventRecord
+        return (
+            self.db.query(RunEventRecord)
+            .filter(RunEventRecord.run_id == run_id)
+            .count()
+        )
 
     # ---------- R ----------
     def get(self, run_id: str) -> Optional[Run]:

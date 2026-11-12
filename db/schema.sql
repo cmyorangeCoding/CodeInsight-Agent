@@ -69,18 +69,28 @@ CREATE INDEX IF NOT EXISTS idx_code_chunks_embedding
 -- =============================================================================
 
 CREATE TABLE IF NOT EXISTS public.runs (
-    run_id           character varying(32) NOT NULL,
-    repo_source      character varying(16) NOT NULL,
-    repo_identifier  character varying(512) NOT NULL,
-    repository_id    character varying(128),
-    question         text NOT NULL,
-    answer           text,
-    status           character varying(16) NOT NULL,
-    strategy         character varying(32),
-    duration_ms      double precision,
-    created_at       timestamp without time zone NOT NULL,
-    updated_at       timestamp without time zone NOT NULL,
-    events_json      text
+    run_id               character varying(32) NOT NULL,
+    repo_source          character varying(16) NOT NULL,
+    repo_identifier      character varying(512) NOT NULL,
+    repository_id        character varying(128),
+    question             text NOT NULL,
+    answer               text,
+    status               character varying(16) NOT NULL,
+    strategy             character varying(32),
+    duration_ms          double precision,
+    created_at           timestamp without time zone NOT NULL,
+    updated_at           timestamp without time zone NOT NULL,
+    events_json          text,
+    -- 断点恢复（2026-11 增量）
+    thread_id            character varying(64),
+    requested_thread_id  character varying(128),
+    requested_strategy   character varying(32),
+    user_id              character varying(64),
+    attempt              integer NOT NULL DEFAULT 0,
+    worker_id            character varying(64),
+    lease_until          timestamp without time zone,
+    cancel_requested     boolean NOT NULL DEFAULT false,
+    last_error           text
 );
 
 ALTER TABLE ONLY public.runs
@@ -90,11 +100,55 @@ CREATE INDEX IF NOT EXISTS idx_runs_created
     ON public.runs USING btree (created_at);
 CREATE INDEX IF NOT EXISTS idx_runs_repo_time
     ON public.runs USING btree (repo_source, repo_identifier, created_at);
+CREATE INDEX IF NOT EXISTS idx_runs_status_lease
+    ON public.runs USING btree (status, lease_until);
+
+
+-- =============================================================================
+-- 2.1 任务执行事件（逐条持久化，支持崩溃补发 / SSE 续传）
+-- =============================================================================
+
+CREATE TABLE IF NOT EXISTS public.run_events (
+    id          serial PRIMARY KEY,
+    run_id      character varying(32) NOT NULL,
+    sequence    integer NOT NULL,
+    event_type  character varying(32) NOT NULL,
+    data        text,
+    created_at  timestamp without time zone NOT NULL,
+    CONSTRAINT uq_run_events_run_seq UNIQUE (run_id, sequence)
+);
+
+CREATE INDEX IF NOT EXISTS idx_run_events_run_seq
+    ON public.run_events USING btree (run_id, sequence);
+
+
+-- =============================================================================
+-- 2.2 有副作用工具的幂等执行记录
+-- =============================================================================
+
+CREATE TABLE IF NOT EXISTS public.tool_executions (
+    idempotency_key  character varying(160) NOT NULL,
+    run_id           character varying(32) NOT NULL,
+    tool_name        character varying(64) NOT NULL,
+    status           character varying(16) NOT NULL,
+    result           text,
+    error            text,
+    attempt          integer NOT NULL DEFAULT 1,
+    created_at       timestamp without time zone NOT NULL,
+    updated_at       timestamp without time zone NOT NULL
+);
+
+ALTER TABLE ONLY public.tool_executions
+    ADD CONSTRAINT tool_executions_pkey PRIMARY KEY (idempotency_key);
+
+CREATE INDEX IF NOT EXISTS idx_tool_executions_run
+    ON public.tool_executions USING btree (run_id);
 
 
 -- =============================================================================
 -- 3. LangGraph 短期记忆（checkpointer）
---    thread_id 与仓库绑定：repo-{repository_id}，同一仓库多次提问自动续接上下文
+--    execution thread_id = run-{run_id}：每个独立任务一条线程，互不干扰、可精确恢复；
+--    conversation_thread_id（runs.requested_thread_id）只用于加载会话上下文，不写入 checkpoint。
 -- =============================================================================
 
 CREATE TABLE IF NOT EXISTS public.checkpoint_migrations (
