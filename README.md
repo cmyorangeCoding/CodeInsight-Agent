@@ -144,7 +144,7 @@ flowchart LR
     A2 --> T
     A3 --> T
     T --> P[RepositoryProvider<br/>本地 / GitHub MCP]
-    T --> V[(PostgreSQL + pgvector<br/>代码索引 / 记忆)]
+    T --> V[("PostgreSQL + pgvector<br/>代码索引 / 记忆")]
     A3 --> VF[Verifier 证据校验]
     VF --> O
     O -->|Tracer 事件| TM
@@ -208,7 +208,7 @@ flowchart TD
     T -->|是| P{策略是否 direct/react?}
     P -->|否| F2[标记 failed：plan_execute 无 checkpoint 可恢复]
     P -->|是| K{checkpoints 表存在该线程记录?}
-    K -->|是| RS[以 resume=True 提交线程池<br/>invoke(None) 从断点续跑]
+    K -->|是| RS["以 resume=True 提交线程池<br/>invoke(None) 从断点续跑"]
     K -->|否| E{该 run 有执行事件?}
     E -->|无| FR[以 resume=False 首次执行]
     E -->|有| F3[标记 failed：无 checkpoint 且已有执行事件]
