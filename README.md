@@ -72,13 +72,13 @@ CodeInsight-Agent 是一个「代码仓库理解」方向的 LLM Agent 项目。
 | `auto` | 默认；由「规则 + 轻量模型」在 `direct` / `react` 之间选择 |
 | `direct` | 定位型问题（某个类/函数在哪个文件） |
 | `react` | 需要多轮工具调用的中等复杂问题 |
-| `plan_execute` | 用户显式选择的深度分析；不参与自动路由 |
+| `plan_execute` | 手动启用的深度分析专家模式；评测中完成率明显低于 `react`，不参与自动路由 |
 
-路由流程：规则先给出建议（命中强复杂信号时置信度 1.0），低置信度再调用摘要模型复核；复核**只升不降**，避免复杂任务被模型误降为 `direct`。`plan_execute` 会被归一为 `react`，只能手动启用。
+路由流程：规则先给出建议（命中强复杂信号时置信度 1.0，直接判 `react`），低置信度再调用摘要模型复核；复核**只升不降**，避免复杂任务被模型误降为 `direct`。自动路由只在 `direct` / `react` 之间选择，模型返回 `plan_execute` 时归一到 `react`；`plan_execute` 只能由调用方手动指定。
 
 每次路由都会分别记录**规则建议 / LLM 建议 / 最终采纳策略 / 采纳原因**（`rule_strategy`、`llm_strategy`、`adoption` 等字段），便于事后归因，不会把不同来源的置信度混在一起。
 
-`plan_execute` 默认**不自动启用**的取舍来自真实评测数据，详见 [ORCHESTRATION_DECISION.md](ORCHESTRATION_DECISION.md)；27 题 × Auto/Direct/ReAct 的路由专项评测见 [ROUTING_EVAL.md](evals/reports/ROUTING_EVAL.md)。
+`plan_execute` 退出自动路由的依据来自同题评测：12 次对比中 `react` 7/7 成功，`plan_execute` 仅 2/12 成功（其余为 partial 或超时），完成题目的质量分基本持平但耗时慢 2~21 倍。也就是说 plan 的实际结果远不如 react，因此只保留手动启用。完整数据与结论见 [ORCHESTRATION_DECISION.md](ORCHESTRATION_DECISION.md)；27 题 × Auto/Direct/ReAct 的路由专项评测见 [ROUTING_EVAL.md](evals/reports/ROUTING_EVAL.md)。
 
 ### 5. 全链路可观测 + SSE 实时推送
 
@@ -175,7 +175,7 @@ flowchart LR
 1. 前端 `POST /api/runs` 创建任务，立即拿到 `run_id`。
 2. 后端把任务提交到线程池，前端通过 `GET /api/runs/{run_id}/events` 建立 SSE 连接。
 3. 后端构建仓库 Provider，执行增量索引（本地仓库或克隆成功的 GitHub 仓库）。
-4. 复杂度路由器决定 `direct` / `react` / `plan_execute`。
+4. 复杂度路由器在 `direct` / `react` 之间选择（`plan_execute` 仅手动指定）。
 5. Agent 通过 RAG 检索、grep、`read_file`、记忆工具收集证据。
 6. 编排层汇总证据并生成最终回答；复杂策略额外经过 Verifier 校验。
 7. 执行事件先写入 `run_events` 再实时推送；任务结束后回答与事件快照写入 `runs` 表。
@@ -528,7 +528,7 @@ CodeInsight-Agent/
 
 ## 设计说明与已知限制
 
-- **编排策略取舍**：`plan_execute` 在不稳定场景下开销显著高于 `react`，因此默认交给用户手动选择，而不是由路由器自动升级。完整数据与结论见 [ORCHESTRATION_DECISION.md](ORCHESTRATION_DECISION.md)。
+- **编排策略取舍**：`plan_execute` 不参与自动路由。12 次同题对比中 `react` 7/7 成功，`plan_execute` 仅 2/12 成功（大量 partial 与超时），完成后质量分基本持平但耗时慢 2~21 倍，因此只保留手动启用。完整数据与结论见 [ORCHESTRATION_DECISION.md](ORCHESTRATION_DECISION.md)。
 - **自动路由偏置**：当前规则在低置信度时默认 `react`，且 LLM 复核只升不降，因此简单任务可能被路由到 `react`。该偏置已在 27 题评测中量化（6 道过度路由、0 道欠路由，其中仅 1 道有明确成本损失），暂未调整规则，详见 [ROUTING_EVAL.md](evals/reports/ROUTING_EVAL.md)。
 - **模型依赖**：当前默认对接阿里云 DashScope 的 OpenAI 兼容接口，更换模型需同时确认对话与 Embedding 能力。
 - **GitHub MCP**：按需读取模式需要本机具备 Node.js 与 `npx`；无 Token 时受公开仓库速率限制。
