@@ -80,8 +80,8 @@ def get_db():
 # runs 表在 2026-11 的断点恢复改造中新增的列。
 # create_all 不会给已存在的表补列，这里用 ADD COLUMN IF NOT EXISTS 做增量迁移。
 _RUNS_NEW_COLUMNS = [
+    ("task_id", "VARCHAR(32)"),
     ("thread_id", "VARCHAR(64)"),
-    ("requested_thread_id", "VARCHAR(128)"),
     ("requested_strategy", "VARCHAR(32)"),
     ("user_id", "VARCHAR(64)"),
     ("attempt", "INTEGER NOT NULL DEFAULT 0"),
@@ -115,7 +115,10 @@ def init_tables() -> None:
                 conn.rollback()
         for ddl in (
             "CREATE INDEX IF NOT EXISTS idx_runs_status_lease ON runs (status, lease_until)",
+            "CREATE INDEX IF NOT EXISTS idx_runs_task_time ON runs (task_id, created_at)",
             "CREATE INDEX IF NOT EXISTS idx_run_events_run_seq ON run_events (run_id, sequence)",
+            # 迁移前的历史数据：每条 run 自成一个单轮任务
+            "UPDATE runs SET task_id = run_id WHERE task_id IS NULL",
         ):
             try:
                 conn.execute(text(ddl))

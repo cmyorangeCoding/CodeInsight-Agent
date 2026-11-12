@@ -14,11 +14,12 @@ def _create(factory, run_id: str, **overrides):
     with factory() as session:
         RunDAO(session).create(
             run_id=run_id,
+            task_id=f"task-{run_id}",
             repo_source="local",
             repo_identifier=".",
             question="分析代码",
             repository_id="repo-1",
-            thread_id=overrides.pop("thread_id", f"run-{run_id}"),
+            thread_id=f"task-{run_id}",
             requested_strategy=overrides.pop("requested_strategy", "react"),
         )
         overrides.setdefault("status", "pending")
@@ -135,32 +136,32 @@ def test_recovery_scheduler_decides_resume_fresh_or_fail(session_factory):
     # 3) 无 checkpoint 但已有事件 → 不可恢复
     _create(session_factory, "run-no-ckpt", status="running", attempt=1,
             lease_until=expired)
-    # 4) plan 策略 → 不可 checkpoint 恢复
+    # 4) plan 策略 + 任务线程有 checkpoint（可能来自上一轮）→ 交给执行器判定
     _create(session_factory, "run-plan", status="running", strategy="plan_execute",
             attempt=1, lease_until=expired)
-    # 5) 旧版本遗留（thread_id 为空）→ 不可恢复
+    # 5) 旧版本遗留（task_id / thread_id 都为空）→ 不可恢复
     _create(session_factory, "run-legacy", status="running", attempt=1,
-            lease_until=expired, thread_id=None)
+            lease_until=expired, task_id=None, thread_id=None)
     # 6) 租约仍有效 → 原 Worker 可能还活着，不能动
     _create(session_factory, "run-alive", status="running", attempt=1,
             lease_until=now + timedelta(seconds=60))
     # 7) 终态任务 → 不扫描
     _create(session_factory, "run-done", status="completed", attempt=1)
 
-    checkpoints = {"run-run-resume", "run-run-plan"}
+    checkpoints = {"task-run-resume", "task-run-plan"}
     scheduler, submitted = _scheduler(
         session_factory, checkpoints, {"run-no-ckpt": 3}
     )
     summary = scheduler.run_once()
 
     assert ("run-resume", True) in submitted
+    assert ("run-plan", True) in submitted
     assert ("run-fresh", False) in submitted
-    assert all(rid not in ("run-plan", "run-legacy", "run-no-ckpt", "run-alive",
+    assert all(rid not in ("run-legacy", "run-no-ckpt", "run-alive",
                            "run-done") for rid, _ in submitted)
-    assert summary["failed"] == 3  # plan / legacy / no-ckpt
-    assert summary["recovered"] == 2
-    assert "仅 direct/react" in _get(session_factory, "run-plan")["last_error"]
-    assert "缺少 thread_id" in _get(session_factory, "run-legacy")["last_error"]
+    assert summary["failed"] == 2  # legacy / no-ckpt
+    assert summary["recovered"] == 3
+    assert "缺少 task_id/thread_id" in _get(session_factory, "run-legacy")["last_error"]
     assert "已有执行事件" in _get(session_factory, "run-no-ckpt")["last_error"]
 
 
@@ -169,7 +170,7 @@ def test_repeated_scheduler_runs_do_not_submit_twice(session_factory):
     _create(session_factory, "run-once", status="running", strategy="react",
             attempt=1, lease_until=expired)
     scheduler, submitted = _scheduler(
-        session_factory, {"run-run-once"}, {}
+        session_factory, {"task-run-once"}, {}
     )
     first = scheduler.run_once()
     second = scheduler.run_once()
@@ -182,6 +183,28 @@ def test_repeated_scheduler_runs_do_not_submit_twice(session_factory):
 def test_recovering_run_can_be_recovered_again_after_restart(session_factory):
     _create(session_factory, "run-recovering", status="recovering", strategy="react",
             attempt=2, lease_until=utcnow() - timedelta(seconds=1))
-    scheduler, submitted = _scheduler(session_factory, {"run-run-recovering"}, {})
+    scheduler, submitted = _scheduler(session_factory, {"task-run-recovering"}, {})
     assert scheduler.run_once()["recovered"] == 1
     assert submitted == [("run-recovering", True)]
+
+
+def test_task_groups_turns_and_limits_one_active_turn(session_factory):
+    """同一 task_id 的多轮归在一起；有未结束轮次时不允许再开新一轮。"""
+    _create(session_factory, "run-a", task_id="task-shared")
+    _create(session_factory, "run-b", task_id="task-shared")
+    _create(session_factory, "run-c", task_id="task-other")
+
+    with session_factory() as session:
+        dao = RunDAO(session)
+        assert [r.run_id for r in dao.list_by_task("task-shared")] == ["run-a", "run-b"]
+        assert dao.has_active_run("task-shared") is True
+        tasks = {t["task_id"]: t for t in dao.list_tasks()}
+        assert tasks["task-shared"]["run_count"] == 2
+        assert tasks["task-shared"]["title"] == "分析代码"
+        assert tasks["task-other"]["run_count"] == 1
+
+    _patch(session_factory, "run-a", status="completed")
+    _patch(session_factory, "run-b", status="failed")
+    with session_factory() as session:
+        assert RunDAO(session).has_active_run("task-shared") is False
+

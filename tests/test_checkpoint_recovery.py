@@ -12,6 +12,7 @@ from langchain_core.messages import AIMessage, HumanMessage
 from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.graph import END, START, StateGraph
 
+from app.api.run_executor import _latest_checkpoint_run_id
 from app.orchestration.executor import Orchestrator
 from app.observability.tracer import Tracer
 
@@ -45,6 +46,34 @@ def _build_graph(checkpointer, log: list[str], fail_once: dict):
     graph.add_edge("b", "c")
     graph.add_edge("c", END)
     return graph.compile(checkpointer=checkpointer)
+
+
+def test_checkpoint_metadata_records_owning_run_for_turn_attribution():
+    """任务线程被多轮共用：metadata.run_id 用来判断最新 checkpoint 属于哪一轮。"""
+    saver = InMemorySaver()
+
+    def node(state):
+        return {"steps": state.get("steps", []) + ["x"]}
+
+    graph = StateGraph(dict)
+    graph.add_node("n", node)
+    graph.add_edge(START, "n")
+    graph.add_edge("n", END)
+    app = graph.compile(checkpointer=saver)
+
+    cfg1 = {"configurable": {"thread_id": "task-t1"},
+            "metadata": {"run_id": "run-turn-1"}}
+    app.invoke({"steps": []}, config=cfg1)
+    assert _latest_checkpoint_run_id(saver, "task-t1") == "run-turn-1"
+
+    # 第二轮尚未写入 checkpoint 时，最新快照仍属于第一轮
+    # → 恢复时必须判定为「本轮未写入」，作为同线程的新一轮执行
+    assert _latest_checkpoint_run_id(saver, "task-t1") != "run-turn-2"
+
+    cfg2 = {"configurable": {"thread_id": "task-t1"},
+            "metadata": {"run_id": "run-turn-2"}}
+    app.invoke({"steps": []}, config=cfg2)
+    assert _latest_checkpoint_run_id(saver, "task-t1") == "run-turn-2"
 
 
 def test_resume_from_checkpoint_after_simulated_crash():

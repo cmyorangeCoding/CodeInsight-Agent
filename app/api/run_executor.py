@@ -1,8 +1,11 @@
 """统一任务执行入口：首次执行与断点恢复共用同一条代码路径。
 
 关键点：
-- execution_thread_id 固定为 run-{run_id}，首次执行与恢复使用同一个 LangGraph 线程；
-- 恢复时先看 checkpoint 的 `next`：非空 → `invoke(None)` 续跑；为空 → 图已完成，直接取最终状态；
+- 一个任务（task）对应一条 LangGraph 线程（task-{task_id}），同一任务的多轮共用；
+- 恢复前先做「轮次归属」判定：最新 checkpoint 的 metadata.run_id 是不是本轮写的；
+    * 是本轮 + `state.next` 非空 → `invoke(None)` 续跑；
+    * 是本轮 + `next` 为空 → 本轮已跑完，只补终态；
+    * 不是本轮 → 本轮还没写过 checkpoint，作为同线程的新一轮执行；
 - 没有 checkpoint 时才按首次执行处理（并明确记录日志，不伪装成恢复）；
 - Plan 模式（step Agent 无 checkpointer）不支持 checkpoint 恢复，直接标记失败并说明原因；
 - 执行期间后台线程定期续租；租约丢失后不再写入任何终态，避免覆盖新 Worker。
@@ -17,7 +20,7 @@ import time
 import traceback
 import uuid
 
-from app.api.task_manager import execution_thread_id, run_manager
+from app.api.task_manager import run_manager, task_thread_id
 from app.db.runs import Run
 from app.event_mapper import map_tracer_to_run_event
 
@@ -161,24 +164,22 @@ def _checkpoint_exists(checkpointer, thread_id: str) -> bool:
         return False
 
 
-def _load_conversation_messages(checkpointer, thread_id: str | None) -> list:
-    """加载会话线程的历史消息，作为新任务的上下文种子（不写入执行线程）。"""
-    if not thread_id or checkpointer is None:
-        return []
+def _latest_checkpoint_run_id(checkpointer, thread_id: str) -> str | None:
+    """任务线程最新 checkpoint 是由哪一轮 run 写的（metadata.run_id）。
+
+    LangGraph 会把 config.metadata 持久化进 checkpoint，恢复时用它做轮次归属判定：
+    同一个任务线程会被多轮共用，只有「本轮写过」才能续跑本轮。
+    """
+    if checkpointer is None:
+        return None
     try:
         tup = checkpointer.get_tuple({"configurable": {"thread_id": thread_id}})
-        if tup is None:
-            return []
-        messages = (tup.checkpoint or {}).get("channel_values", {}).get("messages", [])
-        from langchain_core.messages import AIMessage, BaseMessage, HumanMessage
-
-        history = [
-            m for m in messages
-            if isinstance(m, BaseMessage) and isinstance(m, (HumanMessage, AIMessage))
-        ]
-        return history[-6:]
+        if tup is None or not tup.metadata:
+            return None
+        value = tup.metadata.get("run_id")
+        return str(value) if value else None
     except Exception:  # noqa: BLE001
-        return []
+        return None
 
 
 def execute_run(run_id: str, *, resume: bool, provider=None,
@@ -196,8 +197,12 @@ def execute_run(run_id: str, *, resume: bool, provider=None,
             return
         provider = build_provider_from_record(record)
 
-    thread_id = (record.thread_id if record and record.thread_id
-                 else execution_thread_id(run_id))
+    if record is not None and record.thread_id:
+        thread_id = record.thread_id
+    elif record is not None and record.task_id:
+        thread_id = task_thread_id(record.task_id)
+    else:
+        thread_id = task_thread_id(run_id)
 
     # 认领/接管：恢复路径由调度器先认领并传入 worker_id；首次执行在这里原子认领
     owns_lease = True
@@ -352,14 +357,35 @@ def execute_run(run_id: str, *, resume: bool, provider=None,
             resume_mode: str | None = None
             if resume:
                 if not _checkpoint_exists(checkpointer, thread_id):
-                    raise RecoverUnsupported(
-                        f"thread {thread_id} 不存在可恢复 checkpoint"
-                    )
-                resume_mode = state.strategy
-                if resume_mode not in ("direct", "react"):
-                    raise RecoverUnsupported(
-                        f"策略 {resume_mode!r} 不支持 checkpoint 恢复（仅 direct/react）"
-                    )
+                    # 任务线程还没有任何 checkpoint：本轮从未写入 → 按新的一轮执行
+                    print(f"[run] {run_id} no checkpoint on {thread_id}, run as fresh turn")
+                    resume = False
+                else:
+                    written_by = _latest_checkpoint_run_id(checkpointer, thread_id)
+                    if written_by != run_id:
+                        # 最新 checkpoint 属于之前的轮次：本轮没写过，作为同线程新一轮
+                        print(f"[run] {run_id} latest checkpoint from {written_by}, "
+                              "run as new turn")
+                        resume = False
+
+                if resume:
+                    # 本轮写过 checkpoint：只支持 direct/react（Plan 的 step agent 无 checkpointer）
+                    resume_mode = state.strategy
+                    if resume_mode not in ("direct", "react"):
+                        raise RecoverUnsupported(
+                            f"策略 {resume_mode!r} 不支持 checkpoint 恢复（仅 direct/react）"
+                        )
+                else:
+                    state.status = "running"
+                    # 本轮未写入 checkpoint：按「全新的新一轮」处理，
+                    # 强制策略取用户原始请求值，而不是被上次尝试的落库策略带偏
+                    requested = record.requested_strategy if record else None
+                    forced_name = _FORCE_MAP.get(requested or "", None)
+                    forced = None
+                    if forced_name:
+                        from app.orchestration.models import Strategy
+
+                        forced = Strategy(forced_name)
 
             session = create_session_factory()()
             try:
@@ -421,19 +447,17 @@ def execute_run(run_id: str, *, resume: bool, provider=None,
                 )
 
                 bridge.emit("routing_selected", {"strategy": str(state.strategy or requested or "auto")})
-                conversation_thread = record.requested_thread_id if record else None
-                initial_messages = []
-                if not resume and conversation_thread and conversation_thread != thread_id:
-                    initial_messages = _load_conversation_messages(checkpointer, conversation_thread)
 
+                # 任务线程本身就带着历史轮次的消息，直接追加本轮问题即可，
+                # 不需要再把「会话线程」的消息复制进执行线程。
                 with tool_execution_context(run_id):
                     result = orchestrator.run(
                         question,
                         force_strategy=forced,
                         thread_id=thread_id,
                         resume_mode=resume_mode,
-                        initial_messages=initial_messages,
                         cancel_check=probe,
+                        checkpoint_run_id=run_id,
                     )
 
                 if result.verification is not None:

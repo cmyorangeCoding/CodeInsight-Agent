@@ -88,17 +88,17 @@ CodeInsight-Agent 是一个「代码仓库理解」方向的 LLM Agent 项目。
 
 ### 6. 短期 + 长期记忆
 
-- **短期记忆**：LangGraph `PostgresSaver` checkpointer。执行线程 `execution_thread_id = run-{run_id}` 每个任务独立、可精确恢复；会话上下文由 `conversation_thread_id`（默认 `repo-{repository_id}`）承载，只用于加载历史消息，不写入执行线程。同一仓库多轮提问仍然连续，不同任务之间互不干扰。
+- **短期记忆**：LangGraph `PostgresSaver` checkpointer。同一个任务（`task_id`）的多轮提问共用一条线程 `thread_id = task-{task_id}`，任务内的上下文天然连续；不同任务之间互不干扰。恢复也以任务为粒度定位线程，再判断是哪一轮写了 checkpoint。
 - **长期记忆**：`PostgresStore` 向量记忆库，保存用户偏好与项目事实，通过中间件在每轮请求中按需注入系统提示词。
 - 工具集提供 `search_project_memory` / `search_user_memory` / `save_long_term_memory`，由模型判断何时读写。
 
 ### 7. 历史任务持久化与完整回放
 
-每次任务的问题、回答、状态、策略、耗时与完整事件链路都会写入 PostgreSQL。前端按仓库分组展示历史，并可直接恢复当时的执行进度与代码证据。
+每次任务的问题、回答、状态、策略、耗时与完整事件链路都会写入 PostgreSQL。前端按「仓库 → 任务 → 轮次」组织历史：一个任务代表一次多轮会话，点开后可回看每一轮的问题、回答、执行进度与代码证据。
 
 ### 8. 业务任务断点恢复
 
-每个 Run 使用独立的 `run-{run_id}` 执行线程，执行状态由 LangGraph checkpoint 持续落库。服务崩溃重启后，`RecoveryScheduler` 会自动扫描租约过期的未完成任务，通过数据库原子认领取得执行权，并用原 `thread_id` 从最近 checkpoint 续跑。无法安全恢复的任务会被明确标记为 `failed` 并记录原因，不会静默重跑整个任务。详见[业务任务断点恢复](#业务任务断点恢复)。
+一个任务（`task_id`）对应一条 LangGraph 线程（`thread_id = task-{task_id}`），同一任务的多轮共用它；每一轮提问是一条 `run`，执行状态由 checkpoint 持续落库。服务崩溃重启后，`RecoveryScheduler` 会自动扫描租约过期的未完成 run，通过数据库原子认领取得执行权，先判断最新 checkpoint 是否由本轮写入，再决定续跑本轮还是按同线程的新一轮执行。无法安全恢复的任务会被明确标记为 `failed` 并记录原因，不会静默重跑整个任务。详见[业务任务断点恢复](#业务任务断点恢复)。
 
 ### 9. 自带评测体系
 
@@ -121,7 +121,7 @@ CodeInsight-Agent 是一个「代码仓库理解」方向的 LLM Agent 项目。
 | 实时执行流 | SSE 推送索引进度、工具调用、检索证据、最终回答 |
 | Token 预算控制 | 总预算、单次输入、输出预留三重约束 |
 | 长期记忆 | 用户偏好、项目事实的保存与检索 |
-| 历史任务 | 按仓库分组、详情回看、事件回放、删除 |
+| 历史任务 | 按仓库 → 任务 → 轮次组织，支持详情回看、事件回放、删除 |
 | 断点恢复 | 崩溃重启后自动认领未完成任务，从 LangGraph checkpoint 续跑 |
 | 事件续传 | SSE 按 sequence / `Last-Event-ID` 补发历史事件，重启不丢进度 |
 | GitHub Token 配置 | 前端可直接保存，无需重启后端 |
@@ -172,7 +172,7 @@ flowchart LR
 
 ### 一次请求的执行流程
 
-1. 前端 `POST /api/runs` 创建任务，立即拿到 `run_id`。
+1. 前端 `POST /api/runs` 创建任务：不传 `task_id` = 新建任务，传 `task_id` = 在该任务里继续追问；响应立即返回 `run_id`、`task_id`、`thread_id`。
 2. 后端把任务提交到线程池，前端通过 `GET /api/runs/{run_id}/events` 建立 SSE 连接。
 3. 后端构建仓库 Provider，执行增量索引（本地仓库或克隆成功的 GitHub 仓库）。
 4. 复杂度路由器在 `direct` / `react` 之间选择（`plan_execute` 仅手动指定）。
@@ -184,14 +184,23 @@ flowchart LR
 
 ## 业务任务断点恢复
 
-### 两类线程 ID
+### 线程模型：一个任务一条线程
 
 | 概念 | 取值 | 作用 |
 |---|---|---|
-| `execution_thread_id` | `run-{run_id}` | 承载当前任务的 LangGraph checkpoint，任务之间完全隔离，是恢复执行的唯一依据 |
-| `conversation_thread_id` | 前端传入的 `thread_id`，缺省 `repo-{repository_id}` | 只用于加载历史会话上下文（最近若干轮 Human/AI 消息），不写入执行线程 |
+| `task_id` | `task-{12位hex}` | 会话任务 ID：同一任务的多轮提问共用一个 `task_id`，是上下文与恢复的单位 |
+| `run_id` | `run-{12位hex}` | 单轮请求 ID：一次提问 = 一条 run，用于 SSE、取消、事件与审计 |
+| `thread_id` | `task-{task_id}` | LangGraph checkpoint 线程：同一任务的多轮共用，既是多轮上下文来源，也是断点恢复依据 |
 
-首次执行时把会话上下文作为 `initial_messages` 注入，再拼接用户问题；恢复执行不再注入问题、不开启新一轮对话，而是直接用 `invoke(None)` 从执行线程的 checkpoint 续跑。
+不再有独立的 `conversation_thread_id`。任务的 checkpoint 线程本身就是会话上下文：第 N 轮直接在第 N-1 轮的 checkpoint 上追加消息，不需要把历史消息复制进另一个线程。`runs.requested_thread_id` 列已废弃，新代码不再读写。
+
+因为一条线程被多轮共用，恢复时必须判断「最新 checkpoint 是不是本轮写的」。写入时通过 `config.metadata = {"run_id": ...}` 记录归属（LangGraph 会把 metadata 随 checkpoint 一起持久化），恢复时读取最新 checkpoint 的 `metadata.run_id`：
+
+- **等于本轮** → 本轮已写入：`state.next` 非空则 `invoke(None)` 续跑；为空则本轮已跑完，只补终态；
+- **不等于本轮** → 本轮还没写过 checkpoint：作为同线程的新一轮执行，上一轮消息自然成为上下文；
+- **任务线程没有任何 checkpoint** → 同样视为本轮未写入，按新轮执行。
+
+同一任务同一时间只允许一个非终态 run，避免两轮并发写坏同一条线程（`POST /api/runs` 带 `task_id` 时会返回 409）。
 
 ### 恢复流程
 
@@ -203,27 +212,29 @@ flowchart TD
     Q -->|否| W[按 RECOVERY_INTERVAL 周期重扫]
     Q -->|是| C[数据库原子认领<br/>条件 UPDATE + rowcount]
     C -->|认领失败| W
-    C -->|认领成功| T{存在 thread_id?}
-    T -->|否| F[标记 failed：旧版本任务无法恢复]
-    T -->|是| P{策略是否 direct/react?}
-    P -->|否| F2[标记 failed：plan_execute 无 checkpoint 可恢复]
-    P -->|是| K{checkpoints 表存在该线程记录?}
-    K -->|是| RS["以 resume=True 提交线程池<br/>invoke(None) 从断点续跑"]
+    C -->|认领成功| T{能确定任务线程?}
+    T -->|否| F[标记 failed：缺少 task_id/thread_id]
+    T -->|是| K{任务线程存在 checkpoint?}
+    K -->|是| RS["resume=True 提交线程池<br/>执行器做轮次归属判定"]
+    RS --> D{最新 checkpoint 的<br/>metadata.run_id == 本轮?}
+    D -->|是| RR["invoke(None) 从本轮断点续跑"]
+    D -->|否| FR2[作为同线程的新一轮执行]
     K -->|否| E{该 run 有执行事件?}
     E -->|无| FR[以 resume=False 首次执行]
     E -->|有| F3[标记 failed：无 checkpoint 且已有执行事件]
-    RS --> X[execute_run 续租 + 事件先落库后推送]
+    RR --> X[execute_run 续租 + 事件先落库后推送]
+    FR2 --> X
     FR --> X
     X --> Z{completed / failed / cancelled}
 ```
 
 关键约束：
 
-- **不依赖内存变量伪装恢复**：恢复判定完全来自数据库（`status`、`lease_until`、`thread_id`、`checkpoints` 表、`run_events` 计数）。
+- **不依赖内存变量伪装恢复**：恢复判定完全来自数据库（`status`、`lease_until`、`thread_id`/`task_id`、`checkpoints` 表及其 metadata、`run_events` 计数）。
 - **不会直接重提所有 running 任务**：只有租约缺失或过期的任务才可能被认领；原 Worker 仍在续租时，其它进程无法抢占。
 - **恢复幂等**：认领是条件 UPDATE，重复扫描不会重复提交；`run_manager.is_inflight` 额外挡住本进程内的重复提交。
 - **终态不可恢复**：`completed` / `failed` / `cancelled` 不进入扫描，也不会被覆盖。
-- **Plan 明确不支持 checkpoint 恢复**：`plan_execute` 的分步 Agent 未接 checkpointer，恢复会被标记 `failed` 并写入原因，而不是悄悄重跑整个任务。
+- **Plan 不续跑中间步骤**：`plan_execute` 的分步 Agent 未接 checkpointer，本轮不会写入任何 checkpoint。任务线程没有 checkpoint 时会因「已有执行事件但无 checkpoint」标记 `failed`；若线程上已有之前轮次的 checkpoint，本轮会被判定为「未写入」，按同线程的新一轮重新执行，而不是续跑 Plan 的中间步骤。
 
 ### 状态流转
 
@@ -285,16 +296,16 @@ pending ──claim──> running ──finish──> completed
 | 分组 | 表 | 用途 |
 |---|---|---|
 | RAG 索引 | `code_chunks` | 代码切片 + 1024 维向量 + 全文检索列 `content_tsv` |
-| 历史任务 | `runs` | 仓库路径、问题、回答、耗时、事件快照 `events_json`，以及 `thread_id` / `attempt` / `worker_id` / `lease_until` / `last_error` 等恢复字段 |
+| 历史任务 | `runs` | 仓库路径、问题、回答、耗时、事件快照 `events_json`；`task_id` 归属任务，另有 `thread_id` / `attempt` / `worker_id` / `lease_until` / `last_error` 等恢复字段 |
 | 任务事件 | `run_events` | 逐条持久化的执行事件，`(run_id, sequence)` 唯一，支持崩溃补发与 SSE 续传 |
 | 工具幂等 | `tool_executions` | 有副作用工具的幂等键、执行状态与结果 |
-| 短期记忆 | `checkpoints`、`checkpoint_blobs`、`checkpoint_writes`、`checkpoint_migrations` | LangGraph checkpointer，按 `run-{run_id}` 保存每个任务的执行状态 |
+| 短期记忆 | `checkpoints`、`checkpoint_blobs`、`checkpoint_writes`、`checkpoint_migrations` | LangGraph checkpointer，按 `task-{task_id}` 保存整个任务多轮对话的执行状态 |
 | 长期记忆 | `store`、`store_vectors`、`store_migrations`、`vector_migrations` | PostgresStore 保存用户偏好 / 项目事实，并对文本做向量检索 |
 
-- **短期记忆**分为两层：`execution_thread_id` 保存「单个任务执行到哪一步」，用于崩溃恢复；`conversation_thread_id` 只作为会话上下文来源，不写入执行线程。
+- **短期记忆**只有一层：任务线程 `thread_id = task-{task_id}` 既保存「执行到哪一步」（恢复依据），也是多轮对话的上下文来源；每轮 checkpoint 的 `metadata.run_id` 标明它由哪一轮写入。
 - **长期记忆**保存「跨会话仍然有用的信息」，由 Agent 通过记忆工具按需读写。
 - **任务事件**逐条落库，是服务重启后事件补发的依据；**历史任务**的 `events_json` 与实时 SSE 事件格式一致，历史回看时直接复用前端渲染逻辑。
-- 增量迁移见 [db/migrations/20261111_run_recovery.sql](db/migrations/20261111_run_recovery.sql)；同时 `init_tables()` 会在启动时用 `ADD COLUMN IF NOT EXISTS` 补齐字段，兼容已有历史数据。
+- 增量迁移见 [db/migrations/20261111_run_recovery.sql](db/migrations/20261111_run_recovery.sql) 与 [db/migrations/20261112_task_model.sql](db/migrations/20261112_task_model.sql)；同时 `init_tables()` 会在启动时用 `ADD COLUMN IF NOT EXISTS` 补齐字段，并为历史数据回填 `task_id = run_id`，兼容已有任务。
 
 ---
 
@@ -430,14 +441,17 @@ npm run dev
 | `GET` | `/api/health` | 健康检查 |
 | `GET` | `/api/config` | 读取 GitHub Token 配置状态 |
 | `POST` | `/api/config` | 保存 / 清除 GitHub Token |
-| `POST` | `/api/runs` | 创建分析任务，返回 `run_id` |
-| `GET` | `/api/runs/{run_id}` | 查询任务状态与最终回答 |
+| `POST` | `/api/runs` | 创建任务或用 `task_id` 追加一轮提问，返回 `run_id` / `task_id` / `thread_id` |
+| `GET` | `/api/runs/{run_id}` | 查询单轮状态与最终回答 |
 | `GET` | `/api/runs/{run_id}/events` | SSE 事件流（支持 `?after=` / `?last_sequence=` / `Last-Event-ID` 续传） |
-| `POST` | `/api/runs/{run_id}/cancel` | 取消任务 |
+| `POST` | `/api/runs/{run_id}/cancel` | 取消当前轮 |
 | `GET` | `/api/history/repos` | 按仓库分组的历史列表 |
-| `GET` | `/api/history/runs` | 指定仓库下的任务列表 |
-| `GET` | `/api/history/runs/{run_id}` | 任务详情与事件回放 |
-| `DELETE` | `/api/history/runs/{run_id}` | 删除历史任务 |
+| `GET` | `/api/history/tasks` | 指定仓库下的任务列表（按 `task_id` 聚合） |
+| `GET` | `/api/history/tasks/{task_id}` | 任务详情：摘要 + 按时间正序的全部轮次 |
+| `DELETE` | `/api/history/tasks/{task_id}` | 删除整个任务（全部轮次） |
+| `GET` | `/api/history/runs` | 指定仓库下的单轮列表 |
+| `GET` | `/api/history/runs/{run_id}` | 单轮详情与事件回放 |
+| `DELETE` | `/api/history/runs/{run_id}` | 删除单轮记录 |
 
 主要 SSE 事件：`run_started`、`repo_connected`、`indexing_progress`、`routing_selected`、`retrieval_completed`、`tool_started`、`tool_completed`、`usage_updated`、`plan_event`、`verification_updated`、`answer_final`、`run_completed` / `run_failed` / `run_cancelled`、`run_status`。
 
@@ -538,8 +552,8 @@ CodeInsight-Agent/
 
 ### 断点恢复的可靠性边界
 
-- **仅 `direct` / `react` 可 checkpoint 恢复**：`plan_execute` 的分步 Agent 未接 checkpointer，崩溃后会被标记 `failed`，不会重跑。需要恢复能力的深度分析请使用 `react`。
-- **旧任务不可恢复**：升级前创建、没有 `thread_id` 的历史任务无法关联 checkpoint，恢复调度器会将其标记 `failed` 并写入原因。
+- **仅 `direct` / `react` 会写 checkpoint**：`plan_execute` 的分步 Agent 未接 checkpointer，本轮不会产生可续跑的快照。任务线程没有 checkpoint 时会被标记 `failed`；线程上已有之前轮次的 checkpoint 时，本轮会被判定为「未写入」，按同线程新一轮重新执行，而不是续跑 Plan 的中间步骤。需要续跑能力的深度分析请使用 `react`。
+- **迁移前的历史任务**：升级时会把 `task_id` 回填为 `run_id`，沿用原来 `run-{run_id}` 的线程，因此仍是可恢复的单轮任务；前端会把它显示为只有一个轮次的任务。
 - **无 checkpoint 时的重跑条件很严格**：只有「从未产生任何执行事件」的任务才允许以首次执行方式重跑；已有事件但无 checkpoint 的任务会直接失败，避免把重新执行伪装成恢复。
 - **工具幂等不是 exactly-once**：「副作用已发生、幂等记录未写库」的窗口仍可能重放一次，需要工具自身幂等或外部去重配合；只读工具在恢复时允许重新执行。
 - **Python 线程无法被强制终止**：取消是协作式的（`CancellationProbe` 周期检查内存标记、租约归属与数据库 `cancel_requested`），卡在不可中断调用的线程只能等待其自然返回；编排器内部超时检查也不等于后台线程硬终止。

@@ -132,6 +132,9 @@ class Orchestrator:
         self._cancel_check: Callable[[], bool] | None = None
         # 同一次 run 内缓存编译后的 Agent，避免 get_state / invoke 重复建图
         self._agents: dict[str, Any] = {}
+        # 写入 checkpoint metadata 的「本轮 run_id」：恢复时靠它判断
+        # 最新 checkpoint 是不是当前这一轮写的（任务线程多轮共用）
+        self._checkpoint_run_id = ""
 
     # ------------------------------------------------------------------ 工具
     @staticmethod
@@ -252,6 +255,9 @@ class Orchestrator:
         config = {
             "configurable": {"thread_id": thread_id},
             "callbacks": [self.collector, *self.callbacks],
+            # LangGraph 会把 config.metadata 随 checkpoint 一起持久化（已实测）。
+            # 任务线程被多轮共用，恢复时必须能区分「这一轮有没有写过 checkpoint」。
+            "metadata": {"run_id": self._checkpoint_run_id},
         }
         # 所有模式都强制设 recursion_limit —— LangGraph 默认可能跑 200+ super-step，
         # 一旦 LLM 陷入"工具返回空 → 再调同一个工具"的循环就会无限跑。
@@ -279,14 +285,17 @@ class Orchestrator:
         force_strategy: Strategy | None = None, #强制指定策略，绕过路由判断（调试用）
         thread_id: str | None = None,
         resume_mode: str | None = None,   # 非空 = 从该模式的 LangGraph checkpoint 续跑
-        initial_messages: list | None = None,  # 会话历史（conversation_thread）种子
+        initial_messages: list | None = None,  # 会话历史种子（一般由任务线程自带上下文）
         cancel_check: Callable[[], bool] | None = None,
+        checkpoint_run_id: str | None = None,  # 写入 checkpoint metadata 的业务 run_id
     ) -> OrchestrationResult:
         """执行一次完整编排，或从已有 checkpoint 续跑。"""
         from app.orchestration.complexity import ComplexityRouter
 
         self._start = time.perf_counter()
         self._run_id = f"run-{uuid.uuid4().hex[:12]}"  #生成本次编排唯一 id，run-xxxx，日志追踪用
+        # 业务侧 run_id（数据库主键）优先：恢复时用它判断 checkpoint 归属
+        self._checkpoint_run_id = checkpoint_run_id or self._run_id
         self._retry_count = 0
         self._replan_count = 0
         self._failure_reason = None

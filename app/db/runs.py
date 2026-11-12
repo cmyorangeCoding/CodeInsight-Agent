@@ -33,10 +33,14 @@ def utcnow() -> datetime:
 
 class Run(Base):
     """
-    runs 表：每条记录 = 一次代码分析任务。
+    runs 表：每条记录 = 任务里的一轮提问（一次代码分析请求）。
+
+    层级：仓库 → 任务（task_id，多轮会话）→ run（每一轮提问）。
+    同一 task_id 的多轮 run 共享一条 LangGraph 线程（thread_id = task-{task_id}）。
 
     字段设计：
       - run_id（PK）：32 位 UUID 字符串，和前端 /api/runs/{id} 的 id 一致
+      - task_id：会话任务 ID，同一任务的多轮 run 相同；恢复与上下文都以任务为单位
       - repo_source / repo_identifier：仓库来源分组（local 路径 或 GitHub owner/repo）
       - question / answer：用户输入 + Agent 最终回答（answer 可能很长，用 Text）
       - status：五态（pending→running→completed/failed/cancelled）
@@ -46,7 +50,9 @@ class Run(Base):
     """
     __tablename__ = "runs"
 
-    run_id = Column(String(32), primary_key=True, comment="任务唯一 ID（32 位）")
+    run_id = Column(String(32), primary_key=True, comment="单轮请求 ID（32 位）")
+    task_id = Column(String(32), nullable=True,
+                     comment="会话任务 ID：同一任务的多轮 run 共享一条 LangGraph 线程")
 
     # 仓库分组（联合索引加速按仓库查历史）
     repo_source = Column(String(16), nullable=False, comment="local / github")
@@ -82,9 +88,7 @@ class Run(Base):
 
     # ---------------- 断点恢复相关（2026-11 增量） ----------------
     thread_id = Column(String(64), nullable=True,
-                       comment="LangGraph 执行线程 ID（execution_thread_id）")
-    requested_thread_id = Column(String(128), nullable=True,
-                                 comment="调用方传入的会话线程 ID（conversation_thread_id）")
+                       comment="LangGraph 任务线程 ID（task-{task_id}，同任务多轮共用）")
     requested_strategy = Column(String(32), nullable=True,
                                 comment="创建任务时请求的策略（auto/direct/react/plan）")
     user_id = Column(String(64), nullable=True, comment="用户标识（长期记忆隔离用）")
@@ -99,6 +103,8 @@ class Run(Base):
     __table_args__ = (
         # 按仓库查历史 + 按时间倒序（最常用的查询模式）
         Index("idx_runs_repo_time", "repo_source", "repo_identifier", "created_at"),
+        # 任务内多轮按时间正序
+        Index("idx_runs_task_time", "task_id", "created_at"),
         # 全局时间倒序
         Index("idx_runs_created", "created_at"),
         # 恢复调度器：按状态 + 租约筛选未完成任务
@@ -125,13 +131,18 @@ class RunDAO:
     # ---------- C ----------
     def create(self, run_id: str, repo_source: str, repo_identifier: str,
                question: str, repository_id: str | None = None,
+               task_id: str | None = None,
                thread_id: str | None = None,
                requested_strategy: str | None = None,
-               requested_thread_id: str | None = None,
                user_id: str | None = None) -> Run:
-        """新建一条 run 记录（任务刚创建时调用，status=pending）。"""
+        """新建一条 run 记录（任务刚创建时调用，status=pending）。
+
+        task_id 缺省时退化为 run_id：等价于「这条 run 自成一个单轮任务」，
+        兼容迁移前的历史数据。
+        """
         run = Run(
             run_id=run_id,
+            task_id=task_id or run_id,
             repo_source=repo_source,
             repo_identifier=repo_identifier,
             repository_id=repository_id,
@@ -139,7 +150,6 @@ class RunDAO:
             status="pending",
             thread_id=thread_id,
             requested_strategy=requested_strategy,
-            requested_thread_id=requested_thread_id,
             user_id=user_id,
             attempt=0,
         )
@@ -317,6 +327,83 @@ class RunDAO:
             .count()
         )
 
+    # ---------- 任务（task）维度 ----------
+    def has_active_run(self, task_id: str) -> bool:
+        """同一任务是否还有未结束的一轮（防止多轮并发写同一条线程）。"""
+        return (
+            self.db.query(Run.run_id)
+            .filter(
+                Run.task_id == task_id,
+                Run.status.in_(("pending", "running", "recovering")),
+            )
+            .first()
+            is not None
+        )
+
+    def list_by_task(self, task_id: str) -> list[Run]:
+        """任务内所有轮次，按时间正序（前端按对话顺序渲染）。"""
+        return (
+            self.db.query(Run)
+            .filter(Run.task_id == task_id)
+            .order_by(Run.created_at.asc(), Run.run_id.asc())
+            .all()
+        )
+
+    def list_tasks(self, repo_source: str | None = None,
+                   repo_identifier: str | None = None,
+                   limit: int = 500) -> list[dict]:
+        """按 task_id 聚合出任务列表（标题取第一轮的问题）。
+
+        只查渲染任务列表需要的列，不把 events_json 这种大字段读出来。
+        返回按最近活跃时间倒序的任务摘要。
+        """
+        q = self.db.query(
+            Run.task_id,
+            Run.run_id,
+            Run.repo_source,
+            Run.repo_identifier,
+            Run.repository_id,
+            Run.question,
+            Run.status,
+            Run.created_at,
+            Run.updated_at,
+        )
+        if repo_source:
+            q = q.filter(Run.repo_source == repo_source)
+        if repo_identifier:
+            q = q.filter(Run.repo_identifier == repo_identifier)
+
+        tasks: dict[str, dict] = {}
+        for row in q.order_by(Run.created_at.asc()).limit(limit).all():
+            task_id = row.task_id or row.run_id
+            created = row.created_at.isoformat() if row.created_at else None
+            updated = row.updated_at.isoformat() if row.updated_at else None
+            item = tasks.get(task_id)
+            if item is None:
+                tasks[task_id] = {
+                    "task_id": task_id,
+                    "repo_source": row.repo_source,
+                    "repo_identifier": row.repo_identifier,
+                    "repository_id": row.repository_id,
+                    "title": (row.question or "")[:120],
+                    "run_count": 1,
+                    "status": row.status,
+                    "created_at": created,
+                    "updated_at": updated,
+                }
+            else:
+                item["run_count"] += 1
+                item["status"] = row.status
+                item["updated_at"] = updated
+
+        return sorted(tasks.values(), key=lambda t: t["updated_at"] or "", reverse=True)
+
+    def delete_by_task(self, task_id: str) -> int:
+        """删除一个任务的全部轮次。"""
+        n = self.db.query(Run).filter(Run.task_id == task_id).delete()
+        self.db.commit()
+        return n
+
     # ---------- R ----------
     def get(self, run_id: str) -> Optional[Run]:
         """按 run_id 查单条。"""
@@ -442,6 +529,7 @@ def run_to_dict(run: Run) -> dict:
             events = None
     return {
         "run_id": run.run_id,
+        "task_id": run.task_id,
         "repo_source": run.repo_source,
         "repo_identifier": run.repo_identifier,
         "repository_id": run.repository_id,

@@ -6,18 +6,22 @@ export interface CreateRunRequest {
   repo_path?: string;
   github_url?: string;
   strategy?: string;
-  thread_id?: string;
+  /** 传了 = 在该任务里继续追问；不传 = 新建任务 */
+  task_id?: string;
   user_id?: string;
 }
 
 export interface CreateRunResponse {
   run_id: string;
+  task_id: string;
+  thread_id: string;
   status: string;
   repository_id: string;
 }
 
 export interface RunStatus {
   run_id: string;
+  task_id?: string;
   status: string;
   question: string;
   repo_source: string;
@@ -52,6 +56,7 @@ export interface RunEvent {
 // ---- 历史任务相关 ----
 export interface HistoryRun {
   run_id: string;
+  task_id: string | null;
   repo_source: string;
   repo_identifier: string;
   repository_id: string | null;
@@ -69,6 +74,24 @@ export interface RepoGroup {
   repo_source: string;
   repo_identifier: string;
   run_count: number;
+}
+
+/** 任务：同一 task_id 下多轮提问的聚合（一个任务 = 一次多轮会话） */
+export interface TaskGroup {
+  task_id: string;
+  repo_source: string;
+  repo_identifier: string;
+  repository_id: string | null;
+  title: string;
+  run_count: number;
+  status: string;
+  created_at: string | null;
+  updated_at: string | null;
+}
+
+export interface TaskDetail {
+  task: TaskGroup;
+  runs: HistoryRun[];
 }
 
 const BASE = import.meta.env.VITE_API_BASE_URL || '';
@@ -107,6 +130,17 @@ export const api = {
   // --- 历史任务 ---
   history: {
     listRepos: () => jsonFetch<{ items: RepoGroup[] }>('/api/history/repos'),
+    listTasks: (params?: { repo_source?: string; repo_identifier?: string }) => {
+      const qs = new URLSearchParams();
+      if (params?.repo_source) qs.set('repo_source', params.repo_source);
+      if (params?.repo_identifier) qs.set('repo_identifier', params.repo_identifier);
+      const suffix = qs.toString() ? `?${qs.toString()}` : '';
+      return jsonFetch<{ items: TaskGroup[] }>(`/api/history/tasks${suffix}`);
+    },
+    getTask: (taskId: string) => jsonFetch<TaskDetail>(`/api/history/tasks/${taskId}`),
+    deleteTask: (taskId: string) =>
+      jsonFetch<{ task_id: string; deleted_count: number }>(
+        `/api/history/tasks/${taskId}`, { method: 'DELETE' }),
     listRuns: (params?: { repo_source?: string; repo_identifier?: string; limit?: number; offset?: number }) => {
       const qs = new URLSearchParams();
       if (params?.repo_source) qs.set('repo_source', params.repo_source);

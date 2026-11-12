@@ -24,6 +24,7 @@ import asyncio
 import os
 import queue as queue_module
 import sys
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -32,7 +33,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from sse_starlette.sse import EventSourceResponse
 
-from app.api.task_manager import run_manager, execution_thread_id
+from app.api.task_manager import run_manager, task_thread_id
 from app.config import settings
 
 
@@ -52,13 +53,17 @@ class CreateRunRequest(BaseModel):
     repo_path: str | None = Field(None, description="本地仓库路径（local 模式）")
     github_url: str | None = Field(None, description="GitHub 仓库地址，如 owner/repo 或完整 URL")
     strategy: str = Field("auto", description="auto / direct / react / plan")
-    thread_id: str | None = None
+    task_id: str | None = Field(
+        None, description="任务 ID：传了就作为该任务的新一轮提问，不传则新建任务"
+    )
     user_id: str | None = None
 
 
 class CreateRunResponse(BaseModel):
     """创建任务成功后的响应体（自动序列化为 JSON）。"""
     run_id: str
+    task_id: str
+    thread_id: str
     status: str = "pending"
     repository_id: str
 
@@ -256,10 +261,30 @@ async def update_config(req: UpdateConfigRequest):
 async def create_run(req: CreateRunRequest):
     """创建分析任务（在后台线程跑，不等待完成）。
 
-    结果通过 SSE（/events）或轮询（GET /runs/{id}）获取 —— 前后端职责分离。
+    传 ``task_id`` = 在该任务里继续追问（同一线程，多轮上下文连续）；
+    不传 = 新建一个任务。
     """
+    task_id = (req.task_id or "").strip() or f"task-{uuid.uuid4().hex[:12]}"
+    thread_id = task_thread_id(task_id)
+
     provider = _build_provider(req)
     repo_identifier = req.github_url or req.repo_path or settings.repo.default_local_path or ""
+
+    # 同一任务同一时间只允许一轮在跑，避免并发写坏同一条 checkpoint 线程
+    if req.task_id:
+        try:
+            from app.db import SessionLocal
+            from app.db.runs import RunDAO
+
+            with SessionLocal() as _s:
+                if RunDAO(_s).has_active_run(task_id):
+                    raise HTTPException(
+                        409, "该任务还有未结束的一轮，请等待完成或取消后再提问"
+                    )
+        except HTTPException:
+            raise
+        except Exception as _dbe:
+            print(f"[create_run] WARNING: active-run check failed: {_dbe}")
 
     state = run_manager.create_run(
         question=req.question,
@@ -267,24 +292,24 @@ async def create_run(req: CreateRunRequest):
         repo_identifier=repo_identifier,
         repository_id=provider.repository_id,
         strategy=req.strategy,
+        thread_id=thread_id,
     )
-    state.thread_id = execution_thread_id(state.run_id)
 
     # 写入 runs 表（DB 连不上不影响主流程，降级为内存状态）
-    # thread_id / requested_* 落库是断点恢复的前提：恢复调度器只认数据库里的关联
+    # task_id / thread_id 落库是断点恢复的前提：恢复调度器只认数据库里的关联
     try:
         from app.db import SessionLocal
         from app.db.runs import RunDAO
         with SessionLocal() as _s:
             RunDAO(_s).create(
                 run_id=state.run_id,
+                task_id=task_id,
                 repo_source=req.repo_source,
                 repo_identifier=repo_identifier,
                 question=req.question,
                 repository_id=provider.repository_id,
-                thread_id=state.thread_id,
+                thread_id=thread_id,
                 requested_strategy=req.strategy,
-                requested_thread_id=req.thread_id,
                 user_id=req.user_id,
             )
     except Exception as _dbe:
@@ -303,6 +328,8 @@ async def create_run(req: CreateRunRequest):
 
     return CreateRunResponse(
         run_id=state.run_id,
+        task_id=task_id,
+        thread_id=thread_id,
         status=state.status,
         repository_id=state.repository_id,
     )

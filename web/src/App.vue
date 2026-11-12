@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { ref, computed, onUnmounted, onMounted, watch, type Ref } from 'vue';
-import { api, type RunEvent, type RunStatus, type CreateRunRequest, type HistoryRun, type RepoGroup } from './api';
+import { api, type RunEvent, type RunStatus, type CreateRunRequest, type HistoryRun, type RepoGroup, type TaskGroup } from './api';
 import { marked } from 'marked';
 import hljs from 'highlight.js';
 import 'highlight.js/styles/github.css';
@@ -21,10 +21,14 @@ marked.use({ renderer });
 const repoGroups = ref<RepoGroup[]>([]);
 // 当前选中的仓库分组（点左侧仓库项时更新）
 const activeRepo: Ref<RepoGroup | null> = ref<RepoGroup | null>(null);
-// 当前选中仓库下的 runs
-const runs = ref<HistoryRun[]>([]);
-// runs 列表加载中
-const loadingRuns = ref(false);
+// 当前仓库下的任务列表（一个任务 = 一次多轮会话）
+const tasks = ref<TaskGroup[]>([]);
+// 当前选中的任务；null = 新建任务（草稿）
+const activeTask: Ref<TaskGroup | null> = ref<TaskGroup | null>(null);
+// 当前任务下的所有轮次（按对话顺序）
+const taskRuns = ref<HistoryRun[]>([]);
+const loadingTasks = ref(false);
+const loadingTaskRuns = ref(false);
 
 // 加载所有仓库分组
 async function loadRepos() {
@@ -38,23 +42,37 @@ async function loadRepos() {
   } catch { /* 后端没起或 DB 连不上时静默 */ }
 }
 
-// 加载某个仓库下的 runs
-async function loadRunsOf(repo: RepoGroup | null) {
-  if (!repo) { runs.value = []; return; }
-  loadingRuns.value = true;
+// 加载某个仓库下的任务列表
+async function loadTasksOf(repo: RepoGroup | null) {
+  if (!repo) { tasks.value = []; return; }
+  loadingTasks.value = true;
   try {
-    const res = await api.history.listRuns({
+    const res = await api.history.listTasks({
       repo_source: repo.repo_source,
       repo_identifier: repo.repo_identifier,
-      limit: 200,
     });
-    runs.value = res.items;
+    tasks.value = res.items;
   } catch { /* 静默 */ }
-  finally { loadingRuns.value = false; }
+  finally { loadingTasks.value = false; }
 }
 
-// 监听 activeRepo 变化 → 重新拉 runs
-watch(activeRepo, (repo) => loadRunsOf(repo), { immediate: false });
+// 加载一个任务的全部轮次
+async function loadTaskRuns(taskId: string): Promise<HistoryRun[]> {
+  loadingTaskRuns.value = true;
+  try {
+    const res = await api.history.getTask(taskId);
+    taskRuns.value = res.runs;
+    return res.runs;
+  } catch {
+    taskRuns.value = [];
+    return [];
+  } finally {
+    loadingTaskRuns.value = false;
+  }
+}
+
+// 监听 activeRepo 变化 → 重新拉任务列表
+watch(activeRepo, (repo) => loadTasksOf(repo), { immediate: false });
 
 // ============================= GitHub Token 配置 =============================
 async function loadTokenConfig() {
@@ -117,9 +135,12 @@ const events = ref<RunEvent[]>([]);
 let eventSource: { close(): void } | null = null;
 const errorMsg = ref('');
 
-const selectedHistory = computed(() =>
-  runs.value.find(h => h.run_id === currentRunId.value) || null
+// 当前正在查看/执行的那一轮
+const selectedTurn = computed(() =>
+  taskRuns.value.find(h => h.run_id === currentRunId.value) || null
 );
+// 本轮提交的问题（输入框会清空，这里用于对话区展示）
+const liveQuestion = ref('');
 
 // ============================= 计算属性 =============================
 const finalAnswer = computed(() => {
@@ -127,15 +148,42 @@ const finalAnswer = computed(() => {
     const evt = events.value.slice().reverse().find(e => e.type === 'answer_final');
     if (evt) return (evt.data?.answer as string) || '';
   }
-  if (selectedHistory.value?.answer) return selectedHistory.value.answer;
+  if (selectedTurn.value?.answer) return selectedTurn.value.answer;
   return runStatus.value?.answer || '';
 });
 
-const answerHtml = computed(() => {
-  if (!finalAnswer.value) return '';
-  try { return marked.parse(finalAnswer.value) as string; }
-  catch { return finalAnswer.value; }
+// 对话区展示：历史轮次 + 正在执行的本轮（占位，完成后由后端数据替换）
+const displayTurns = computed<HistoryRun[]>(() => {
+  const list = [...taskRuns.value];
+  const id = currentRunId.value;
+  if (id && !list.some(r => r.run_id === id)) {
+    list.push({
+      run_id: id,
+      task_id: activeTask.value?.task_id || null,
+      repo_source: activeTask.value?.repo_source || repoSource.value,
+      repo_identifier: activeTask.value?.repo_identifier || '',
+      repository_id: activeTask.value?.repository_id || null,
+      question: liveQuestion.value,
+      answer: finalAnswer.value,
+      status: running.value ? 'running' : (runStatus.value?.status || 'pending'),
+      strategy: runStatus.value?.strategy || null,
+      duration_ms: null,
+      created_at: new Date().toISOString(),
+      updated_at: null,
+      events: null,
+    });
+  }
+  return list;
 });
+
+const answerHtml = computed(() => renderMarkdown(finalAnswer.value));
+
+// 对话区的每一轮回答也走同一套 markdown 渲染
+function renderMarkdown(text: string): string {
+  if (!text) return '';
+  try { return marked.parse(text) as string; }
+  catch { return text; }
+}
 
 const retrievalEvents = computed(() =>
   events.value.filter(e => e.type === 'retrieval_completed')
@@ -148,6 +196,7 @@ function clearView() {
   runStatus.value = null;
   events.value = [];
   question.value = '';
+  liveQuestion.value = '';
   errorMsg.value = '';
   eventSource?.close();
   eventSource = null;
@@ -170,38 +219,72 @@ function formatTime(isoStr: string | null): string {
   return `${d.getMonth() + 1}/${d.getDate()} ${hm}`;
 }
 
-// ============================= 创建新任务 =============================
+// ============================= 提交：新建任务 或 在任务内追问 =============================
 async function onSubmit() {
   if (!question.value.trim() || running.value) return;
+  const task = activeTask.value;
   running.value = true;
   errorMsg.value = '';
   events.value = [];
+  liveQuestion.value = question.value;
 
-  const req: CreateRunRequest = {
-    question: question.value,
-    repo_source: repoSource.value,
-    repo_path: repoSource.value === 'local' ? localPath.value : undefined,
-    github_url: repoSource.value === 'github' ? githubUrl.value : undefined,
-    strategy: strategy.value,
-  };
+  const req: CreateRunRequest = task
+    ? {
+        question: question.value,
+        repo_source: task.repo_source as 'local' | 'github',
+        repo_path: task.repo_source === 'local' ? task.repo_identifier : undefined,
+        github_url: task.repo_source === 'github' ? task.repo_identifier : undefined,
+        strategy: strategy.value,
+        task_id: task.task_id,
+      }
+    : {
+        question: question.value,
+        repo_source: repoSource.value,
+        repo_path: repoSource.value === 'local' ? localPath.value : undefined,
+        github_url: repoSource.value === 'github' ? githubUrl.value : undefined,
+        strategy: strategy.value,
+      };
+
+  const src = task ? task.repo_source : repoSource.value;
+  const repoId = task
+    ? task.repo_identifier
+    : (repoSource.value === 'local' ? localPath.value : githubUrl.value || '');
 
   try {
     const res = await api.createRun(req);
     currentRunId.value = res.run_id;
+    question.value = '';
 
     // 如果后端返回的仓库分组不在 repoGroups 里（新建仓库），刷新 repoGroups
-    const repoId = repoSource.value === 'local' ? localPath.value : githubUrl.value || '';
     const repoExists = repoGroups.value.some(
-      g => g.repo_source === repoSource.value && g.repo_identifier === repoId
+      g => g.repo_source === src && g.repo_identifier === repoId
     );
-    if (!repoExists) {
-      await loadRepos();
+    if (!repoExists) await loadRepos();
+
+    const group = repoGroups.value.find(
+      g => g.repo_source === src && g.repo_identifier === repoId
+    ) || null;
+    if (!activeRepo.value
+        || activeRepo.value.repo_source !== src
+        || activeRepo.value.repo_identifier !== repoId) {
+      activeRepo.value = group;  // watcher 会刷新任务列表
     }
 
-    // 选中当前仓库
-    activeRepo.value = repoGroups.value.find(
-      g => g.repo_source === repoSource.value && g.repo_identifier === repoId
-    ) || null;
+    // 新任务：先用返回值占位，任务结束后由后端聚合结果替换
+    if (!task) {
+      activeTask.value = {
+        task_id: res.task_id,
+        repo_source: src,
+        repo_identifier: repoId,
+        repository_id: res.repository_id,
+        title: liveQuestion.value.slice(0, 120),
+        run_count: 1,
+        status: res.status,
+        created_at: new Date().toISOString(),
+        updated_at: null,
+      };
+      taskRuns.value = [];
+    }
 
     subscribeEvents(res.run_id);
 
@@ -275,30 +358,48 @@ function subscribeEvents(id: string) {
   eventSource = { close: () => es.close() };
 }
 
-// 任务结束后刷新 runs 列表（后端已自动写 DB，前端只需重新拉）
+// 本轮结束后刷新：任务详情（全部轮次）+ 任务列表 + 仓库计数
 async function fetchFinalStatus(id: string) {
   try {
     runStatus.value = await api.getRun(id);
   } catch { /* ignore */ }
-  // 刷新当前仓库下的 runs（新 run 会出现在顶部）
-  if (activeRepo.value) {
-    await loadRunsOf(activeRepo.value);
+
+  if (activeTask.value) {
+    const taskId = activeTask.value.task_id;
+    await loadTaskRuns(taskId);
+    if (activeRepo.value) await loadTasksOf(activeRepo.value);
+    // 新任务刚创建时本地是占位对象，这里换成后端聚合的真实摘要
+    const fresh = tasks.value.find(t => t.task_id === taskId);
+    if (fresh) activeTask.value = fresh;
   }
   await loadRepos();  // 更新各仓库的 run_count
 }
 
-// ============================= 点击仓库分组 → 切换左侧栏 runs =============================
+// ============================= 点击仓库分组 → 切换任务列表 =============================
 function selectRepoGroup(group: RepoGroup) {
+  if (running.value) return;
   activeRepo.value = group;
+  activeTask.value = null;
+  taskRuns.value = [];
   clearView();
 }
 
-// ============================= 点击 run → 查看历史 =============================
-async function selectRun(item: HistoryRun) {
+// ============================= 点击任务 → 打开多轮对话 =============================
+async function selectTask(task: TaskGroup) {
   if (running.value) return;
   clearView();
+  activeTask.value = task;
+  const list = await loadTaskRuns(task.task_id);
+  // 默认查看最后一轮的执行过程
+  if (list.length > 0) await selectTurn(list[list.length - 1]);
+}
+
+// ============================= 点击某一轮 → 查看该轮执行过程 =============================
+async function selectTurn(item: HistoryRun) {
+  if (running.value) return;
   currentRunId.value = item.run_id;
-  question.value = item.question;
+  errorMsg.value = '';
+  events.value = [];
 
   // 优先用 DB 里存的 events 快照（恢复完整的执行进度 + 代码证据）
   const created = new Date(item.created_at || Date.now()).getTime();
@@ -351,24 +452,31 @@ async function selectRun(item: HistoryRun) {
   } catch { /* ignore */ }
 }
 
-// ============================= 删除 run =============================
-async function deleteRun(runId: string) {
-  if (!confirm('确定删除这条历史记录？')) return;
+// ============================= 删除任务（含全部轮次） =============================
+async function deleteTask(taskId: string) {
+  if (running.value) return;
+  if (!confirm('确定删除这个任务的所有轮次？')) return;
   try {
-    await api.history.deleteRun(runId);
-    runs.value = runs.value.filter(r => r.run_id !== runId);
-    if (currentRunId.value === runId) clearView();
+    await api.history.deleteTask(taskId);
+    tasks.value = tasks.value.filter(t => t.task_id !== taskId);
+    if (activeTask.value?.task_id === taskId) {
+      activeTask.value = null;
+      taskRuns.value = [];
+      clearView();
+    }
     await loadRepos();
   } catch { /* ignore */ }
 }
 
-// ============================= 清空当前仓库的所有 run =============================
+// ============================= 清空当前仓库的所有任务 =============================
 async function clearCurrentRepo() {
   if (!activeRepo.value) return;
   if (!confirm(`确定清空仓库 "${activeRepo.value.repo_identifier}" 的所有历史记录？`)) return;
   try {
     await api.history.deleteByRepo(activeRepo.value.repo_source, activeRepo.value.repo_identifier);
-    runs.value = [];
+    tasks.value = [];
+    taskRuns.value = [];
+    activeTask.value = null;
     if (currentRunId.value) clearView();
     await loadRepos();
     if (repoGroups.value.length > 0) {
@@ -385,10 +493,12 @@ async function onCancel() {
   try { await api.cancelRun(currentRunId.value); } catch { /* ignore */ }
 }
 
-// ============================= 新建空白对话 =============================
+// ============================= 新建空白任务 =============================
 function newChat() {
   if (running.value) return;
   clearView();
+  activeTask.value = null;
+  taskRuns.value = [];
 }
 
 // ============================= 生命周期 =============================
@@ -432,25 +542,39 @@ onUnmounted(() => { eventSource?.close(); });
             <span class="repo-count">{{ group.run_count }}</span>
           </div>
 
-          <!-- 该仓库下的 runs -->
+          <!-- 该仓库下的任务（任务 → 轮次） -->
           <div v-if="activeRepo?.repo_source === group.repo_source && activeRepo?.repo_identifier === group.repo_identifier"
                class="repo-runs">
-            <div v-if="loadingRuns" class="repo-runs-loading">加载中…</div>
-            <div v-else-if="runs.length === 0" class="repo-runs-empty">暂无任务</div>
+            <div v-if="loadingTasks" class="repo-runs-loading">加载中…</div>
+            <div v-else-if="tasks.length === 0" class="repo-runs-empty">暂无任务</div>
             <div v-else class="run-items">
-              <div v-for="item in runs" :key="item.run_id"
+              <div v-for="task in tasks" :key="task.task_id"
                    class="run-item"
-                   :class="{ active: currentRunId === item.run_id }"
-                   @click="selectRun(item)">
-                <div class="ri-header">
-                  <span class="ri-status" :class="'status-' + item.status">
-                    {{ item.status === 'completed' ? '✓' : item.status === 'failed' ? '✗' : item.status === 'running' ? '⏳' : '○' }}
+                   :class="{ active: activeTask?.task_id === task.task_id }">
+                <div class="ri-header" @click="selectTask(task)">
+                  <span class="ri-status" :class="'status-' + task.status">
+                    {{ task.status === 'completed' ? '✓' : task.status === 'failed' ? '✗' : task.status === 'running' ? '⏳' : '○' }}
                   </span>
-                  <span class="ri-time">{{ formatTime(item.created_at) }}</span>
-                  <button class="ri-delete" @click.stop="deleteRun(item.run_id)" title="删除">✕</button>
+                  <span class="ri-time">{{ formatTime(task.updated_at || task.created_at) }}</span>
+                  <span class="task-count">{{ task.run_count }} 轮</span>
+                  <button class="ri-delete" @click.stop="deleteTask(task.task_id)" title="删除任务">✕</button>
                 </div>
-                <div class="ri-question">
-                  {{ item.question.length > 45 ? item.question.slice(0, 45) + '…' : item.question }}
+                <div class="ri-question" @click="selectTask(task)">
+                  {{ task.title.length > 45 ? task.title.slice(0, 45) + '…' : task.title }}
+                </div>
+
+                <!-- 任务内的轮次 -->
+                <div v-if="activeTask?.task_id === task.task_id && taskRuns.length > 0" class="turn-items">
+                  <div v-for="(t, ti) in taskRuns" :key="t.run_id"
+                       class="turn-item"
+                       :class="{ active: currentRunId === t.run_id }"
+                       @click.stop="selectTurn(t)">
+                    <span class="turn-no">#{{ ti + 1 }}</span>
+                    <span class="turn-text">
+                      {{ t.question.length > 26 ? t.question.slice(0, 26) + '…' : t.question }}
+                    </span>
+                  </div>
+                  <div v-if="loadingTaskRuns" class="turn-loading">加载中…</div>
                 </div>
               </div>
             </div>
@@ -459,7 +583,7 @@ onUnmounted(() => { eventSource?.close(); });
       </div>
 
       <!-- 底部 -->
-      <div v-if="activeRepo && runs.length > 0" class="sidebar-footer">
+      <div v-if="activeRepo && tasks.length > 0" class="sidebar-footer">
         <button class="clear-all-btn" @click="clearCurrentRepo">
           清空 · {{ activeRepo.repo_identifier.slice(-20) }}
         </button>
@@ -477,8 +601,9 @@ onUnmounted(() => { eventSource?.close(); });
       </header>
 
       <main :class="{ 'progress-collapsed': progressCollapsed, 'answer-full': answerFullscreen }">
-        <!-- A. 仓库配置区 -->
+        <!-- A. 仓库配置区（新建任务）/ 当前任务信息（任务内追问） -->
         <section class="panel repo-config">
+          <template v-if="!activeTask">
           <h2>📦 仓库配置</h2>
           <div class="radio-group">
             <label><input type="radio" v-model="repoSource" value="local" /> 本地仓库</label>
@@ -515,6 +640,22 @@ onUnmounted(() => { eventSource?.close(); });
             </div>
           </div>
 
+          </template>
+          <template v-else>
+            <div class="task-bar">
+              <h2>📌 当前任务</h2>
+              <div class="task-bar-row">
+                <span class="task-bar-repo">
+                  {{ activeTask.repo_source === 'github' ? '🐙' : '📁' }} {{ activeTask.repo_identifier }}
+                </span>
+                <span class="task-bar-meta">
+                  {{ activeTask.run_count }} 轮对话 · {{ formatTime(activeTask.updated_at || activeTask.created_at) }}
+                </span>
+                <span class="task-bar-hint">在下方继续追问，多轮共享同一会话上下文</span>
+              </div>
+            </div>
+          </template>
+
           <!-- 路由策略选择 -->
           <div class="strategy-row">
             <label>🧭 分析策略：</label>
@@ -530,19 +671,46 @@ onUnmounted(() => { eventSource?.close(); });
           </div>
         </section>
 
-        <!-- B. 对话区 -->
+        <!-- B. 对话区：任务内多轮对话 + 输入 -->
         <section class="panel chat">
-          <h2>💬 对话</h2>
+          <div class="panel-header">
+            <h2>💬 对话</h2>
+            <span v-if="activeTask" class="task-badge">
+              {{ activeTask.run_count }} 轮 · 同一会话上下文
+            </span>
+          </div>
+
+          <div v-if="displayTurns.length > 0" class="turn-list">
+            <div v-for="(t, ti) in displayTurns" :key="t.run_id" class="turn">
+              <div class="turn-q">
+                <span class="turn-role">你 · #{{ ti + 1 }}</span>
+                <span class="turn-q-text">{{ t.question }}</span>
+              </div>
+              <div class="turn-a">
+                <span class="turn-role ai">AI</span>
+                <div v-if="t.answer" class="answer-markdown turn-answer" v-html="renderMarkdown(t.answer)"></div>
+                <div v-else class="turn-pending">
+                  {{ t.status === 'running' ? '分析中…' : t.status === 'failed' ? '本轮失败' : '暂无回答' }}
+                </div>
+              </div>
+            </div>
+          </div>
+          <p v-else class="hint">
+            {{ activeTask
+              ? '这个任务还没有对话记录，在下方输入第一个问题。'
+              : '新建任务：选择仓库并提问；之后可在同一任务里继续追问，多轮共享上下文。' }}
+          </p>
+
           <textarea
             v-model="question"
-            placeholder="输入代码分析问题，例如：这个项目的核心架构是什么？"
+            :placeholder="activeTask ? '继续追问，例如：刚才提到的模块在哪里被调用？' : '输入代码分析问题，例如：这个项目的核心架构是什么？'"
             :disabled="running"
             @keydown.ctrl.enter="onSubmit"
-            rows="3"
+            rows="2"
           />
           <div class="button-row">
             <button @click="onSubmit" :disabled="running || !question.trim()">
-              {{ running ? '分析中…' : '🚀 分析' }}
+              {{ running ? '分析中…' : activeTask ? '🚀 继续追问' : '🚀 新建任务并分析' }}
             </button>
             <button v-if="running" @click="onCancel" class="cancel">⏹ 取消</button>
           </div>
@@ -784,6 +952,56 @@ body {
   word-break: break-word;
   display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden;
 }
+
+/* ===== 任务（多轮会话） ===== */
+.task-count {
+  font-size: 10px; color: #1d4ed8; background: #eff6ff;
+  padding: 1px 5px; border-radius: 8px; flex-shrink: 0;
+}
+.turn-items { margin-top: 6px; padding-left: 10px; border-left: 1px dashed #e5e7eb; }
+.turn-item {
+  display: flex; gap: 6px; padding: 4px 6px; border-radius: 5px;
+  font-size: 11px; color: #6b7280; cursor: pointer; transition: background 0.1s;
+}
+.turn-item:hover { background: #f3f4f6; }
+.turn-item.active { background: #dbeafe; color: #1d4ed8; }
+.turn-no { color: #9ca3af; flex-shrink: 0; font-variant-numeric: tabular-nums; }
+.turn-text { overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
+.turn-loading { font-size: 11px; color: #9ca3af; padding: 2px 6px; }
+
+/* 当前任务信息条 */
+.task-bar h2 { margin-bottom: 8px; }
+.task-bar-row { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; font-size: 13px; }
+.task-bar-repo {
+  font-family: monospace; color: #374151; background: #f9fafb;
+  border: 1px solid #e5e7eb; padding: 3px 8px; border-radius: 6px;
+}
+.task-bar-meta { color: #6b7280; }
+.task-bar-hint { color: #3b82f6; font-size: 12px; }
+.task-badge {
+  font-size: 12px; color: #1d4ed8; background: #eff6ff;
+  padding: 2px 8px; border-radius: 10px;
+}
+
+/* 对话区：多轮记录 */
+.hint { color: #9ca3af; font-size: 13px; margin: 0 0 10px; }
+.turn-list {
+  max-height: 360px; overflow-y: auto; padding-right: 4px; margin-bottom: 12px;
+  display: flex; flex-direction: column; gap: 10px;
+}
+.turn-list::-webkit-scrollbar { width: 6px; }
+.turn-list::-webkit-scrollbar-thumb { background: #d1d5db; border-radius: 3px; }
+.turn { border: 1px solid #f3f4f6; border-radius: 10px; padding: 10px 12px; background: #fcfcfd; }
+.turn-q { display: flex; gap: 8px; align-items: flex-start; margin-bottom: 8px; }
+.turn-q-text { font-size: 14px; color: #111827; font-weight: 500; word-break: break-word; }
+.turn-a { display: flex; gap: 8px; align-items: flex-start; }
+.turn-role {
+  flex-shrink: 0; font-size: 11px; color: #6b7280; background: #f3f4f6;
+  border-radius: 6px; padding: 1px 6px; margin-top: 2px;
+}
+.turn-role.ai { color: #1d4ed8; background: #eff6ff; }
+.turn-answer { flex: 1; font-size: 14px; }
+.turn-pending { font-size: 13px; color: #9ca3af; font-style: italic; }
 
 /* 底部 */
 .sidebar-footer { padding: 10px 16px; border-top: 1px solid #f3f4f6; }

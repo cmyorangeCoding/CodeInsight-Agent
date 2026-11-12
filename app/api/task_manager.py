@@ -20,13 +20,14 @@ from app.api.events import RunEvent, RunState
 from app.api.publisher import RunEventPublisher
 
 
-def execution_thread_id(run_id: str) -> str:
-    """Run → LangGraph execution_thread_id 的稳定映射。
+def task_thread_id(task_id: str) -> str:
+    """Task → LangGraph 线程 ID 的稳定映射。
 
-    run_id 本身已带 ``run-`` 前缀时直接复用，避免出现 ``run-run-xxx``；
-    新任务统一是 ``run-{12位hex}``，因此等价于 ``thread_id = run-{run_id}``。
+    一个任务（多轮会话）只对应一条线程，同一任务的所有轮次共用它，
+    这样多轮上下文与断点恢复都以「任务」为单位。
+    迁移前的历史任务 task_id == run_id，直接复用原有线程，避免断链。
     """
-    return run_id if run_id.startswith("run-") else f"run-{run_id}"
+    return task_id if task_id.startswith(("task-", "run-")) else f"task-{task_id}"
 
 
 class _TracerBridge:
@@ -80,8 +81,6 @@ class RunManager:
             status=status,
             start_time=time.time(),
         )
-        if not state.thread_id:
-            state.thread_id = execution_thread_id(state.run_id)
 
         event_queue: queue.Queue = queue.Queue()
         cancel_event = threading.Event()

@@ -65,11 +65,13 @@ CREATE INDEX IF NOT EXISTS idx_code_chunks_embedding
 
 -- =============================================================================
 -- 2. 历史任务表
+--    层级：仓库 → 任务（task_id，多轮会话）→ run（每一轮提问）
 --    events_json: 完整执行事件快照（与实时 SSE 同格式），用于历史回放
 -- =============================================================================
 
 CREATE TABLE IF NOT EXISTS public.runs (
     run_id               character varying(32) NOT NULL,
+    task_id              character varying(32),
     repo_source          character varying(16) NOT NULL,
     repo_identifier      character varying(512) NOT NULL,
     repository_id        character varying(128),
@@ -83,7 +85,6 @@ CREATE TABLE IF NOT EXISTS public.runs (
     events_json          text,
     -- 断点恢复（2026-11 增量）
     thread_id            character varying(64),
-    requested_thread_id  character varying(128),
     requested_strategy   character varying(32),
     user_id              character varying(64),
     attempt              integer NOT NULL DEFAULT 0,
@@ -102,6 +103,8 @@ CREATE INDEX IF NOT EXISTS idx_runs_repo_time
     ON public.runs USING btree (repo_source, repo_identifier, created_at);
 CREATE INDEX IF NOT EXISTS idx_runs_status_lease
     ON public.runs USING btree (status, lease_until);
+CREATE INDEX IF NOT EXISTS idx_runs_task_time
+    ON public.runs USING btree (task_id, created_at);
 
 
 -- =============================================================================
@@ -147,8 +150,9 @@ CREATE INDEX IF NOT EXISTS idx_tool_executions_run
 
 -- =============================================================================
 -- 3. LangGraph 短期记忆（checkpointer）
---    execution thread_id = run-{run_id}：每个独立任务一条线程，互不干扰、可精确恢复；
---    conversation_thread_id（runs.requested_thread_id）只用于加载会话上下文，不写入 checkpoint。
+--    thread_id = task-{task_id}：一个任务（多轮会话）一条线程；
+--    同一任务的多轮提问共用 checkpoint，恢复以「任务里未完成的那一轮」为单位，
+--    靠 checkpoint.metadata.run_id 判断最新快照是不是本轮写的。
 -- =============================================================================
 
 CREATE TABLE IF NOT EXISTS public.checkpoint_migrations (

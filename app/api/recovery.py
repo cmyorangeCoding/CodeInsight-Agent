@@ -3,9 +3,10 @@
 安全规则：
 1. 数据库递归认领（条件 UPDATE），同一 Run 同时只有一个 Worker；
 2. 租约未过期的 running 任务视为「原 Worker 可能还活着」，绝不动它；
-3. 有 checkpoint + 已知 direct/react 策略 → 用原 thread_id 续跑；
+3. 任务线程上有 checkpoint → 交给执行器做轮次归属判定：
+   本轮写过就续跑，没写过就作为同线程的新一轮执行；
 4. 没有 checkpoint 但从未产生任何事件（attempt 仅首次）→ 允许安全地首次执行；
-5. 其余不可恢复情况（旧版本遗留、Plan 模式、无 checkpoint 但有执行痕迹）
+5. 其余不可恢复情况（旧版本遗留、无 checkpoint 但有执行痕迹）
    → 标记 failed 并写入原因，不伪装成恢复成功；
 6. 进程内 _inflight / run_manager.is_inflight 双重去重，重复触发调度器不会重复提交。
 """
@@ -17,7 +18,7 @@ import time
 from functools import partial
 
 from app.api.run_executor import LEASE_SECONDS, execute_run, new_worker_id
-from app.api.task_manager import run_manager, execution_thread_id
+from app.api.task_manager import run_manager, task_thread_id
 
 RECOVERY_ENABLED = os.getenv("RECOVERY_ENABLED", "true").lower() != "false"
 RECOVERY_INTERVAL = float(os.getenv("RECOVERY_INTERVAL_SECONDS", "30"))
@@ -126,9 +127,9 @@ class RecoveryScheduler:
                 rows = [
                     {
                         "run_id": r.run_id,
+                        "task_id": r.task_id,
                         "thread_id": r.thread_id,
                         "status": r.status,
-                        "strategy": r.strategy,
                         "attempt": r.attempt or 0,
                     }
                     for r in candidates
@@ -172,23 +173,19 @@ class RecoveryScheduler:
         if not claimed:
             return "skipped"
 
-        thread_id = row["thread_id"] or execution_thread_id(run_id)
-        strategy = row["strategy"]
-
-        # 2) 缺 thread_id 的旧版本任务：没有稳定 checkpoint 关联，不能恢复
-        if not row["thread_id"]:
-            return self._fail(run_id, "历史任务缺少 thread_id，无法关联 checkpoint")
+        if row["thread_id"]:
+            thread_id = row["thread_id"]
+        elif row["task_id"]:
+            thread_id = task_thread_id(row["task_id"])
+        else:
+            return self._fail(run_id, "历史任务缺少 task_id/thread_id，无法关联 checkpoint")
 
         has_ckpt = self._checkpoint_probe(thread_id)
 
-        # 3) 有 checkpoint：只支持 direct/react（Plan 的 step agent 无 checkpointer）
+        # 3) 有 checkpoint：交给执行器做轮次归属判定（本轮写过就续跑，
+        #    最新 checkpoint 属于上一轮就作为同线程的新一轮执行；
+        #    Plan 的 step agent 无 checkpointer，会在执行器里被判定为本轮未写入）
         if has_ckpt:
-            if strategy not in ("direct", "react"):
-                return self._fail(
-                    run_id,
-                    f"checkpoint 存在但执行策略为 {strategy!r}，"
-                    "仅 direct/react 支持 checkpoint 恢复",
-                )
             return self._submit(run_id, resume=True)
 
         # 4) 无 checkpoint：只有「从未产生任何事件」才允许安全地首次执行
